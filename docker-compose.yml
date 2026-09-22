@@ -1,0 +1,506 @@
+# The whole twin, in one command.
+#
+#   ./setup.sh              once, after cloning: tools, .env files, secrets
+#   docker compose up -d    every time after that
+#   docker compose down
+#
+# Seven services over one Postgres and one Redis. Before this file each
+# repository stood up a server of its own and they collided by port - twice in
+# one week, both times diagnosed at `make db-up` (see twin-engine/docs/ports.md).
+# The servers are shared now; the schemas are not. Each repository keeps its own
+# database on the one server, named in docker/postgres/initdb.d/10-databases.sql.
+#
+# `name:` is pinned rather than taken from this directory, because the network
+# the four sibling compose files join is `${name}_default` and renaming the
+# checkout would silently strand every one of them.
+name: twin
+
+# --------------------------------------------------------------------------
+# Config
+#
+# Each repository keeps its own .env - that is what `make run` and `pnpm dev`
+# read on the host, and duplicating those keys here would be a second copy to
+# keep in agreement. `env_file` loads them; `environment` below pins the values
+# that must differ inside a container, and wins over the file.
+#
+# The root .env holds only what compose itself needs *before* a container
+# exists: values interpolated into a volume path, a published port, or a build
+# argument. `./setup.sh` writes it. `.env.example` lists what goes in it.
+# --------------------------------------------------------------------------
+
+# twin-backend's repository, mounted so its source is editable, with the
+# container's own install kept out of the host tree's way.
+#
+# One anonymous volume per workspace member, not just the root one: pnpm's
+# isolated linker puts each member's dependency links in that member's own
+# `node_modules`, so protecting only the root leaves every one of them shadowed
+# by the bind mount and the backend crash-loops on ERR_MODULE_NOT_FOUND.
+#
+# A new workspace package needs a line here and a COPY in that repo's Dockerfile.
+x-backend-volumes: &backend-volumes
+  - ./twin-backend:/app
+  # The container's install, not the host's: not interchangeable across platforms.
+  - /app/node_modules
+  - /app/apps/backend/node_modules
+  - /app/packages/config/node_modules
+  - /app/packages/connectors/node_modules
+  - /app/packages/contracts/node_modules
+  - /app/packages/core/node_modules
+  - /app/packages/db/node_modules
+  - /app/packages/engine/node_modules
+  - /app/packages/queue/node_modules
+  - /app/packages/telemetry/node_modules
+  # The cached connector catalogue, which must survive a container restart:
+  # rebuilding it needs the connectors service to be reachable.
+  - twin-catalogue:/var/twin
+
+services:
+  # ------------------------------------------------------------------ data --
+
+  # pgvector rather than stock postgres: twin-memory's first migration declares
+  # `Vector(1536)` columns and fails on a server without the extension. The
+  # other two databases never ask for it and pay nothing for its presence.
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: twin
+      POSTGRES_PASSWORD: twin
+      # The maintenance database only. The three that hold anything are created
+      # by the init script below, which cannot run while connected to its own
+      # target - so this has to be a fourth name, not one of theirs.
+      POSTGRES_DB: twin
+      # Makes comparisons deterministic regardless of the host's locale, which
+      # is what twin-backend's integration suite asserts against.
+      POSTGRES_INITDB_ARGS: '--locale=C --encoding=UTF8'
+    ports:
+      - '${POSTGRES_PORT:-5500}:5432'
+    volumes:
+      - twin-postgres-data:/var/lib/postgresql/data
+      # Read-only, and read exactly once: the image runs this directory only
+      # when the data directory is empty.
+      - ./docker/postgres/initdb.d:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Every service below waits on this. Returning before the server accepts
+      # queries would just move the failure into their first migration.
+      test: ['CMD-SHELL', 'pg_isready -U twin -d twin']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Three tenants, one server, and their keys do not overlap: twin-backend's
+  # BullMQ queues are `bull:*`, its delivery claims `twin:delivered:*`,
+  # twin-connectors' rate limiter is `rate:*`, and twin-memory's event queue is
+  # `twin:events`. All on database 0 deliberately - the backend *writes* the
+  # list twin-memory *reads*, so they have to be on the same one.
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    # Persistence on, which reverses the choice twin-backend's own compose made.
+    # It was right there: that Redis held only rebuildable cache and queue
+    # state, and keeping it across a database reset preserved jobs pointing at
+    # rows that no longer existed. It is wrong here, because this Redis now also
+    # holds `twin:events` - activity on its way into the memory store, with no
+    # copy anywhere else until the consumer has taken it.
+    #
+    # The old failure mode is still real, so it moved rather than vanished:
+    # resetting Postgres means flushing Redis in the same breath.
+    #   docker compose down -v      (both, together, which is the safe order)
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '${REDIS_PORT:-6500}:6379'
+    volumes:
+      - twin-redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # ------------------------------------------------------------------ apps --
+
+  # The API, the ingest worker and the webhook receiver, in one process.
+  backend:
+    build: ./twin-backend
+    # restart: unless-stopped
+    command: ['node', 'apps/backend/src/index.ts']
+    env_file: [./twin-backend/.env]
+    environment:
+      # Pinned, and not from .env: `API_PORT` is the *host* side of the mapping
+      # below, so a .env that also set it would move what the app listens on
+      # while the mapping still pointed at 8080, and nothing would answer.
+      API_PORT: 8080
+      DATABASE_URL: postgres://twin:twin@postgres:5432/twin_backend
+      REDIS_URL: redis://redis:6379
+      # The list twin-memory's consumer drains. Unset, the sink is not built at
+      # all and every activity stops at this service's own database - which is
+      # what happened before this file existed: the code has shipped since the
+      # memory split, with nothing configured to turn it on.
+      SINK_REDIS_URL: redis://redis:6379
+      SINK_KEY: twin:events
+      # Overridable because a provider that refuses a plaintext redirect uri
+      # needs this to be an https tunnel for the duration of one connect.
+      BASE_URL: ${BASE_URL:-http://localhost:8080}
+      # The one origin CORS allows and the origin on the event stream. The
+      # frontend is in this file now, so this defaults to it rather than to the
+      # backend's own /connected page. localhost and 127.0.0.1 are different
+      # origins to a browser: this must match what you type in the address bar.
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4000}
+      # Service names, not host ports: everything this process dials is on this
+      # network now. That is most of what got simpler - these two were
+      # `host.docker.internal` round trips back out to published ports because
+      # the four stacks could not see each other.
+      CONNECTORS_URL: http://connectors:8090
+      TWIN_ENGINE_URL: http://engine:8000
+      # The last catalogue read, so a connectors outage at boot is a stale
+      # provider list rather than an empty one. On a named volume, because a
+      # container restart must not lose it.
+      CATALOGUE_CACHE_PATH: /var/twin/catalogue.json
+    ports:
+      - '${API_PORT:-8080}:8080'
+    volumes: *backend-volumes
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      # Started, not healthy: the catalogue read is retried and falls back to
+      # the cache above, so a slow connectors must not hold the API down.
+      connectors: { condition: service_started }
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('node:http').get({host:'127.0.0.1',port:8080,path:'/health'},
+          r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # `docker compose watch` (via `docker compose watch` at the root), not
+    # `node --watch`: this bind mount is virtiofs, which never emits the inotify
+    # events `node --watch` needs. Compose watches from the host instead.
+    develop:
+      watch:
+        - action: restart
+          path: ./twin-backend/apps
+        - action: restart
+          path: ./twin-backend/packages
+
+  # Every provider's code, and no database at all. It publishes no host port:
+  # the backend reaches it over this network and nothing else should reach it.
+  #
+  # There is deliberately no line here inheriting twin-backend's .env.
+  # DATABASE_URL and CREDENTIAL_ENCRYPTION_KEY live there, and handing them to
+  # this service would make compromising it as bad as compromising the backend,
+  # which is the whole reason the two are separate (ADR 25).
+  connectors:
+    build: ./twin-connectors
+    restart: unless-stopped
+    env_file: [./twin-connectors/.env]
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      REDIS_URL: redis://redis:6379
+      PROVIDER_CONFIG_DIR: /app/config/providers
+      CONNECTORS_PORT: 8090
+      # The Claude Code agent is a host process - it drives tmux and reads
+      # ~/.claude on this machine, so no container can hold it. This is Docker's
+      # alias for the host, so the request still never leaves it.
+      CLAUDE_CODE_BASE_URL: ${CLAUDE_CODE_BASE_URL:-http://host.docker.internal:47600}
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      # Mounted rather than baked, so an edit needs a restart and not a rebuild.
+      # node_modules stays the image's - the host's would shadow it.
+      - ./twin-connectors/src:/app/src
+      - ./twin-connectors/packages:/app/packages
+      - ./twin-connectors/config:/app/config
+      - /app/node_modules
+      - /app/packages/config/node_modules
+      - /app/packages/core/node_modules
+      - /app/packages/ingest/node_modules
+      - /app/packages/providers/node_modules
+      - /app/packages/queue/node_modules
+      - /app/packages/sdk/node_modules
+      - /app/packages/telemetry/node_modules
+    depends_on:
+      redis: { condition: service_healthy }
+    develop:
+      watch:
+        - action: restart
+          path: ./twin-connectors/src
+        - action: restart
+          path: ./twin-connectors/packages
+        - action: restart
+          path: ./twin-connectors/config/providers
+
+  # The agent runtime. Its entrypoint creates the database if the server has
+  # none and brings the schema to head before uvicorn serves anything, so
+  # `twin_engine` needs nothing from the init script beyond existing.
+  engine:
+    build: ./twin-engine
+    restart: unless-stopped
+    # Compose's default is 10s, then SIGKILL. This process waits up to
+    # `shutdown.DEADLINE_SECONDS` for the turns still driving, and anything
+    # under that makes the wait a number nobody honours.
+    stop_grace_period: 45s
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      # Named for the connectors service and pointed at the backend, which is
+      # correct and has always been confusing: what this dials is the backend's
+      # connector-facing API on 8080, not twin-connectors on 8090.
+      CONNECTORS_URL: http://backend:8080
+      # Langfuse is not in this file - it is its own stack under infra/langfuse
+      # - so it is still reached across the host.
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://host.docker.internal:3000}
+      # One root for every tenant: `<TWIN_ROOT>/<company>/<account>`. Mounted
+      # below at the same absolute path it has on the host, which is the whole
+      # trick: a `cwd` the twin passes to `sessions.spawn` is a host path to the
+      # Claude Code agent and a container path in here, and they have to be the
+      # same string or every spawn lands somewhere that does not exist.
+      TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
+      # The other half of the same relationship, in the other direction: where
+      # this person's history is read from. It is dialled by the *twin* and no
+      # longer by the backend, which used to rank every prompt against it and
+      # paste the answer into the turn - the twin holds memory tools now and
+      # calls them when it decides the question needs history.
+      #
+      # Unset is a real state: the twin then answers out of its connectors and
+      # its conversation, and binds no memory tools at all.
+      MEMORY_URL: http://memory-api:8000
+    # Deliberately not a `depends_on`: a memory service that is down must cost
+    # a lookup and not the engine's boot. Each lookup degrades to a sentence
+    # saying memory was unreachable, which the model can act on.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    # 127.0.0.1, not 0.0.0.0: `twin_api` is an unauthenticated dev harness
+    # (spec 7), and publishing it on every interface would serve it to the LAN.
+    ports:
+      - '127.0.0.1:${TWIN_API_PORT:-8000}:8000'
+    volumes:
+      # Read-write, and the only host path this container can reach. What keeps
+      # one tenant out of another's directory is the jail in
+      # `agent_runtime/tenancy.py`, not this mount.
+      - ${TWIN_ROOT}:${TWIN_ROOT}
+      # The relay secret, read-only. `load_secret` mints one where it finds
+      # none, so without this the container mints its own and every call from
+      # the backend - which holds the host's copy in TWIN_ENGINE_SECRET -
+      # answers 401. Mounted rather than passed, because the loader reads a file
+      # and takes no environment variable. `./setup.sh` mints the host's copy.
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  frontend:
+    build:
+      context: ./twin-frontend
+      args:
+        # `next build` inlines this into the client bundle, so it cannot arrive
+        # at runtime the way the urls below do - changing it needs a rebuild.
+        # Publishable by design, so an image layer holding it gives nothing away.
+        # It has to be interpolated from the root .env rather than read from
+        # .env.local, because `env_file` feeds a container and not a build.
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
+    restart: unless-stopped
+    env_file: [./twin-frontend/.env.local]
+    environment:
+      NODE_ENV: production
+      TWIN_ENV: ${TWIN_ENV:-dev}
+      # Fixed, like the backend's: a container has its own namespace, so only
+      # the host side varies and `frontend:4000` then means one thing.
+      PORT: 4000
+      # Pinned: .env.local holds the localhost url `next dev` needs on the host,
+      # and inside this container localhost is this container.
+      TWIN_API_URL: http://backend:8080
+      # TWIN_PUBLIC_URL is deliberately NOT pinned. It is this app's own public
+      # origin - the browser's view - so it is the same string on the host and
+      # in here, and .env.local is its one copy. Pinning it with a default of
+      # :8080 is what broke Connect: the frontend sends `<origin>/connections`
+      # as `returnTo`, and the backend refuses any origin that is not
+      # FRONTEND_URL's. Move this and the backend's FRONTEND_URL together.
+      # The server half reads the publishable key too, so it is here as well as
+      # in the build args above. The secret key comes from .env.local and is
+      # never a build arg, which would leave it in an image layer.
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?}
+    ports:
+      - '${FRONTEND_PORT:-4000}:4000'
+    # A bare `/` answers a redirect to /sign-in with no session, which is the
+    # correct response and a fine liveness signal.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('node:http').get({host:'127.0.0.1',port:4000},
+          r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    depends_on:
+      backend: { condition: service_started }
+
+  # ---------------------------------------------------------------- memory --
+  #
+  # Two processes over one store, which is a directory of files plus a SQLite
+  # index rebuildable from them. They are split because they fail differently:
+  # the consumer falling behind is a queue that drains later, the API being down
+  # is every turn losing its recall.
+
+  # The write half: drains `twin:events` into the store, forever.
+  memory-consumer:
+    build: ./twin-memory
+    restart: unless-stopped
+    # `--card-every 10` turns on the one paid stage on the write path: every
+    # tenth batch, and again whenever the queue goes quiet, threads that have
+    # settled are carded. Without it a live store accumulates threads no card
+    # has ever read, and the facts lane - which is what retrieval actually
+    # ranks over - stays empty until somebody runs `store card` by hand.
+    #
+    # `settled_only` is what makes the rhythm affordable rather than reckless:
+    # a conversation arriving over six batches is one call once it goes quiet,
+    # not six as it grows. Set it to 0 to go back to never spending here.
+    command:
+      ['python', '-m', 'consumer', '/var/twin/store', '--card-every', '${MEMORY_CARD_EVERY:-10}']
+    env_file: [./twin-memory/.env]
+    environment:
+      # Database 0 explicitly, and the same one the backend's sink writes to.
+      REDIS_URL: redis://redis:6379/0
+      # `none` is lexical-only retrieval and needs no model. The alternative
+      # pulls sentence-transformers - hundreds of megabytes into the image, and
+      # the mlx backend the Makefile mentions is Apple-silicon-only and cannot
+      # run in this Linux container at all.
+      TWIN_EMBEDDER: ${TWIN_EMBEDDER:-none}
+    volumes:
+      - twin-memory-store:/var/twin/store
+    depends_on:
+      redis: { condition: service_healthy }
+
+  # The read half: what the twin's `memory_*` tools dial, one lookup at a time.
+  #
+  # 127.0.0.1 for the same reason the engine is: nothing here authenticates a
+  # caller, so the only safe audience is this machine.
+  memory-api:
+    build: ./twin-memory
+    restart: unless-stopped
+    command: ['python', '-m', 'api']
+    env_file: [./twin-memory/.env]
+    environment:
+      TWIN_STORE: /var/twin/store
+      # The same queue the consumer drains, and the only reason this service
+      # needs one: `/memory/unfiled` reports what has arrived and is not filed
+      # yet, which is the twin's way of telling "memory does not have this"
+      # apart from "memory has not read it yet". Unset, `consumer.queue.connect`
+      # falls back to localhost - which inside this container is this container
+      # - so that route answered `available: false` on every call and the twin
+      # was told the queue was down when it was two containers away and healthy.
+      REDIS_URL: redis://redis:6379/0
+      # 0.0.0.0 is this container's own namespace, not the host's network:
+      # inside here loopback is this container, so nothing would reach the
+      # published port without it.
+      TWIN_HOST: 0.0.0.0
+      TWIN_PORT: 8000
+      TWIN_EMBEDDER: ${TWIN_EMBEDDER:-none}
+    ports:
+      - '127.0.0.1:${MEMORY_API_PORT:-8200}:8000'
+    depends_on:
+      # Started, not healthy, and not required: a Redis that is down costs this
+      # service one route - `/memory/unfiled` says so and answers - where the
+      # store on disk answers everything else.
+      redis: { condition: service_started }
+    volumes:
+      # The same store the consumer writes. One SQLite writer and one reader over
+      # one index: a query sees every batch the consumer has committed, with no
+      # restart, because the reader's open connection reads committed state. A
+      # batch still in flight is the only thing it cannot see yet.
+      - twin-memory-store:/var/twin/store
+    healthcheck:
+      # `/health` opens the store and answers with its root, which is what this
+      # service being up actually means. It used to ask for `/openapi.json`,
+      # because there was no health route - that answered from the framework
+      # and would have kept answering with the store shut.
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',
+          timeout=3).status < 500 else 1)"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ---------------------------------------------------------------- tunnel --
+  #
+  # A public url for the one direction nothing else provides: a provider
+  # dialling us. Every other call in this system is outbound, which is why
+  # BASE_URL could stay loopback until a connector declared `mode: webhook`.
+  #
+  # Both are off by default - they publish this machine to the internet, and
+  # most work here never needs that. They front the backend, which is the only
+  # service any provider dials, so they live here rather than in that repo.
+
+  # A hostname you own, routed in Cloudflare to `http://backend:8080` on this
+  # network. The name survives a restart, so BASE_URL can live in .env and no
+  # provider's registered url needs re-entering.
+  #
+  #   docker compose --profile tunnel-named up -d
+  tunnel-named:
+    image: cloudflare/cloudflared:latest
+    profiles: ['tunnel-named']
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      # QUIC binds a source address and never rebinds it, so a route change on a
+      # multi-interface host wedges every UDP dial - `sendmsg: network is
+      # unreachable` - and the tunnel serves 530 until restarted: four times in
+      # ninety minutes once, always after a healthy registration. `auto` does
+      # fall back to HTTP/2, but it chooses once at startup while QUIC still
+      # works and never revisits that, so it picks QUIC on this host every time.
+      # The registration line should read `protocol=http2`.
+      - --protocol
+      - http2
+      - run
+      - --token
+      # Soft default on purpose: compose interpolates before it filters by
+      # profile, so `:?` here would fail every ordinary `docker compose up` for
+      # anyone without a token.
+      - ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      backend: { condition: service_started }
+
+  # No account and no hostname of your own. A quick tunnel is renamed on every
+  # start, so each run needs BASE_URL moved and every provider's Request URL
+  # re-registered by hand:
+  #
+  #   docker compose --profile tunnel up -d tunnel
+  #   docker compose logs tunnel | grep -o 'https://.*trycloudflare.com'
+  #   BASE_URL=<that> docker compose up -d --force-recreate backend
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ['tunnel']
+    # Deliberately not restarted. Coming back on its own means a new hostname
+    # that BASE_URL and the provider's registered url both point away from -
+    # working in appearance and delivering nothing. Staying down is honest.
+    restart: 'no'
+    command: tunnel --no-autoupdate --url http://backend:8080
+    depends_on:
+      backend: { condition: service_started }
+
+volumes:
+  twin-postgres-data:
+  twin-redis-data:
+  # The cached connector catalogue, which must survive a container restart.
+  twin-catalogue:
+  # The memory store: the ledger is canonical and the index is rebuilt from it,
+  # so losing this loses everything the twin remembers that is not still in
+  # twin-backend's `events` table.
+  twin-memory-store:
+
+# Pinned off 172.19/16, which is this office's LAN (172.19.2.0/23). Compose's
+# default pick swallowed it once: every container routed 172.19.2.202 onto its
+# own bridge and got EHOSTUNREACH. One subnet here now covers all seven.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${TWIN_SUBNET:-10.201.0.0/16}
