@@ -2,6 +2,7 @@
 #
 #   ./setup.sh              once, after cloning: tools, .env files, secrets
 #   docker compose up -d    every time after that
+#   docker compose up --watch   same, and restarts/rebuilds a service when its source changes
 #   docker compose down
 #
 # Seven services over one Postgres and one Redis. Before this file each
@@ -184,6 +185,10 @@ services:
           path: ./twin-backend/apps
         - action: restart
           path: ./twin-backend/packages
+        # The install lives in the image's anonymous volumes, so a new
+        # dependency needs the image rebuilt, not the process restarted.
+        - action: rebuild
+          path: ./twin-backend/pnpm-lock.yaml
 
   # Every provider's code, and no database at all. It publishes no host port:
   # the backend reaches it over this network and nothing else should reach it.
@@ -231,6 +236,8 @@ services:
           path: ./twin-connectors/packages
         - action: restart
           path: ./twin-connectors/config/providers
+        - action: rebuild
+          path: ./twin-connectors/pnpm-lock.yaml
 
   # The agent runtime. Its entrypoint creates the database if the server has
   # none and brings the schema to head before uvicorn serves anything, so
@@ -289,6 +296,26 @@ services:
       - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
     depends_on:
       postgres: { condition: service_healthy }
+    # No bind mount - the source is baked into the image - so compose copies an
+    # edit in and restarts. The project is an editable install over /app/src,
+    # and the restart re-runs the entrypoint, so a new migration is applied too.
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./twin-engine/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+        - action: sync+restart
+          path: ./twin-engine/prompts
+          target: /app/prompts
+        - action: sync+restart
+          path: ./twin-engine/migrations
+          target: /app/migrations
+          ignore: ['**/__pycache__/']
+        - action: rebuild
+          path: ./twin-engine/pyproject.toml
+        - action: rebuild
+          path: ./twin-engine/uv.lock
 
   frontend:
     build:
@@ -337,6 +364,23 @@ services:
       start_period: 20s
     depends_on:
       backend: { condition: service_started }
+    # A production `next build`, so there is no dev server to hot-reload: every
+    # change is a rebuild of the image, which takes a minute, not a second. For
+    # instant HMR run `pnpm dev` on the host instead.
+    develop:
+      watch:
+        - action: rebuild
+          path: ./twin-frontend
+          ignore:
+            - node_modules/
+            - .next/
+            - .git/
+            - tests/
+            - docs/
+            - test-results/
+            - playwright-report/
+            - coverage/
+            - '**/*.md'
 
   # ---------------------------------------------------------------- memory --
   #
@@ -373,6 +417,19 @@ services:
       - twin-memory-store:/var/twin/store
     depends_on:
       redis: { condition: service_healthy }
+    # Source is baked, not mounted: compose copies an edit in and restarts.
+    # `consumer` and `twin_db` are found through PYTHONPATH=/app/src, so a
+    # synced file is what runs without reinstalling anything.
+    develop:
+      watch: &memory-watch
+        - action: sync+restart
+          path: ./twin-memory/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+        - action: rebuild
+          path: ./twin-memory/pyproject.toml
+        - action: rebuild
+          path: ./twin-memory/uv.lock
 
   # The read half: what the twin's `memory_*` tools dial, one lookup at a time.
   #
@@ -412,6 +469,8 @@ services:
       # restart, because the reader's open connection reads committed state. A
       # batch still in flight is the only thing it cannot see yet.
       - twin-memory-store:/var/twin/store
+    develop:
+      watch: *memory-watch
     healthcheck:
       # `/health` opens the store and answers with its root, which is what this
       # service being up actually means. It used to ask for `/openapi.json`,
