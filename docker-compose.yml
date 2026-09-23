@@ -411,8 +411,9 @@ services:
   # Coding tasks (twin-engine production runtime spec §6.2-6.3). A task runs
   # dsh in a box of its own - a container from `twin-box:dev`, which
   # `make sandbox-image` builds in twin-engine - and these five are the box's
-  # world: the worker that drives it, the one path to Docker, and the three
-  # things a box can reach on `twin-sandbox`, which has no route out.
+  # world: the worker that drives it, the one path to Docker, the three
+  # things a box can reach on `twin-sandbox`, which has no route out, and the git
+  # proxy a repository is reached through.
   #
   # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
   # touches a box. The only service that reaches Docker, and only through
@@ -431,6 +432,10 @@ services:
       # What the task card links to: the gateway below, on the host port it is
       # published on. The box id in it is the capability.
       TWIN_PREVIEW_URL: http://{box}.{port}.preview.localhost:${TWIN_PREVIEW_PORT:-47620}
+      # A repo box's `origin`, and where the worker asks for the account's
+      # GitHub credential to open its draft pull request.
+      TWIN_GIT_PROXY_URL: http://git-proxy:8400
+      TWIN_BACKEND_URL: http://backend:8080
     networks: [default, docker-api]
     volumes:
       # The relay secret: the codec's key, and what box tokens are minted under.
@@ -480,6 +485,22 @@ services:
     env_file: [./twin-engine/.env]
     environment:
       DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+    networks: [default, twin-sandbox]
+    volumes:
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+
+  # A repo box's `origin`: its own repository only, its own task's branch only,
+  # with the account's GitHub credential put on here and never in the box.
+  git-proxy:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code.git_proxy']
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      TWIN_BACKEND_URL: http://backend:8080
     networks: [default, twin-sandbox]
     volumes:
       - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
