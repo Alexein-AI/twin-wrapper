@@ -382,6 +382,9 @@ services:
       MEMORY_URL: http://memory-api:8000
       TEMPORAL_ADDRESS: temporal:7233
       REDIS_URL: redis://redis:6379
+      # The twin's task tools call the engine's API from inside a turn: the
+      # routes that start and steer a coding task are there, not here.
+      TWIN_ENGINE_URL: http://engine:8000
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     volumes:
@@ -404,6 +407,105 @@ services:
           target: /app/prompts
         - action: rebuild
           path: ./twin-engine/uv.lock
+
+  # Coding tasks (twin-engine production runtime spec §6.2-6.3). A task runs
+  # dsh in a box of its own - a container from `twin-box:dev`, which
+  # `make sandbox-image` builds in twin-engine - and these five are the box's
+  # world: the worker that drives it, the one path to Docker, and the three
+  # things a box can reach on `twin-sandbox`, which has no route out.
+  #
+  # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
+  # touches a box. The only service that reaches Docker, and only through
+  # `docker-proxy`, on a network nothing else joins.
+  code-worker:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code']
+    stop_grace_period: 30s
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      TEMPORAL_ADDRESS: temporal:7233
+      REDIS_URL: redis://redis:6379
+      DOCKER_HOST: tcp://docker-proxy:2375
+      # What the task card links to: the gateway below, on the host port it is
+      # published on. The box id in it is the capability.
+      TWIN_PREVIEW_URL: http://{box}.{port}.preview.localhost:${TWIN_PREVIEW_PORT:-47620}
+    networks: [default, docker-api]
+    volumes:
+      # The relay secret: the codec's key, and what box tokens are minted under.
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+      docker-proxy: { condition: service_started }
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./twin-engine/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+
+  # Docker's API, narrowed to what box lifecycle needs: containers, exec,
+  # volumes, and reads of images and networks. No swarm, no secrets, no
+  # plugins, no build. It filters by endpoint and not by payload, so it keeps
+  # a bug in the worker off the rest of the API but does not stop the worker
+  # asking for a privileged container; production runs boxes behind a
+  # provider (spec §6.3), and this is the laptop's stand-in.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      EXEC: 1
+      VOLUMES: 1
+      IMAGES: 1
+      NETWORKS: 1
+      INFO: 1
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [docker-api]
+
+  # Where a box's model calls go: `DEEPSEEK_BASE_URL` in every box. It checks
+  # the box's token, charges the project's live task, refuses past the task's
+  # ceiling, and forwards to OpenRouter with the one real key - which is here
+  # and in no box.
+  llm-proxy:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code.llm_proxy']
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+    networks: [default, twin-sandbox]
+    volumes:
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+
+  # A box's only route to the internet: package registries and GitHub reads
+  # (`twin-engine/sandbox/egress/squid.conf` says which, and why).
+  egress:
+    image: ubuntu/squid:6.13-25.04_beta
+    restart: unless-stopped
+    volumes:
+      - ./twin-engine/sandbox/egress/squid.conf:/etc/squid/squid.conf:ro
+    networks: [default, twin-sandbox]
+
+  # The preview gateway: `http://<box>.<port>.preview.localhost:47620` is what
+  # box <box> serves on <port>. Published on loopback; `*.localhost` resolves
+  # there in every browser, so it needs no DNS.
+  preview:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    volumes:
+      - ./twin-engine/sandbox/preview/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - '127.0.0.1:${TWIN_PREVIEW_PORT:-47620}:80'
+    networks: [default, twin-sandbox]
 
   frontend:
     build:
@@ -655,3 +757,15 @@ networks:
     ipam:
       config:
         - subnet: ${TWIN_SUBNET:-10.201.0.0/16}
+  # Where boxes live. Internal: no gateway, so a box reaches `egress`,
+  # `llm-proxy` and `preview` by name and nothing else at all. Named, because
+  # the code worker creates boxes on it by that name.
+  twin-sandbox:
+    name: twin-sandbox
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TWIN_SANDBOX_SUBNET:-10.202.0.0/16}
+  # The code worker and the Docker API proxy, and nothing else.
+  docker-api:
+    internal: true
