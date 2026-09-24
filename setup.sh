@@ -22,8 +22,9 @@
 #      copied there from ~/.twin-relay/secret like the backend's copy. It was a
 #      read-only mount until the sandbox work, and a mounted file is readable
 #      by `execute` where the app's environment is not.
-#   3. The sandbox images - a tenant's container and its egress proxy - are
-#      built here, because the broker starts them and no compose service does.
+#   3. The sandbox images - a tenant's container, its egress proxy, and a
+#      coding task's box - are built here, because the broker and the code
+#      worker start them and no compose service does.
 #      Claude Code runs in those containers (twin-engine SANDBOX-PLAN 7); a
 #      machine that ran the old host agent has it retired below.
 #   4. The root .env carries what compose interpolates before a container exists
@@ -419,6 +420,35 @@ if [ -f "$relay_file" ]; then
       || fatal "could not write twin-engine/.env"
   fi
 fi
+
+# 6. MEMORY_API_SECRET, the bearer twin-memory asks of every store read. Minted
+#    in twin-memory and copied to the engine, its one caller: without it, any
+#    container on the compose network could read any account's memory by naming
+#    it in a header.
+memory_secret="$(env_get "$MEMORY/.env" MEMORY_API_SECRET 2>/dev/null)"
+if [ -z "$memory_secret" ]; then
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "MEMORY_API_SECRET is unset in twin-memory - would mint it"
+    STATUS=1
+  else
+    memory_secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_')"
+    env_set "$MEMORY/.env" MEMORY_API_SECRET "$memory_secret" \
+      && ok "minted MEMORY_API_SECRET in twin-memory/.env" \
+      || fatal "could not write twin-memory/.env"
+  fi
+fi
+if [ -n "$memory_secret" ]; then
+  if [ "$(env_get "$ENGINE/.env" MEMORY_API_SECRET 2>/dev/null)" = "$memory_secret" ]; then
+    ok "MEMORY_API_SECRET matches in twin-engine"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "MEMORY_API_SECRET in twin-engine does not match twin-memory's - would copy it"
+    STATUS=1
+  else
+    env_set "$ENGINE/.env" MEMORY_API_SECRET "$memory_secret" \
+      && ok "copied MEMORY_API_SECRET into twin-engine/.env" \
+      || fatal "could not write twin-engine/.env"
+  fi
+fi
 finish_if_fatal
 
 # -------------------------------------------------------------- root env ---
@@ -463,12 +493,13 @@ for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN; do
 done
 
 # ------------------------------------------------------------ sandbox images ---
-# What tenant containers and their egress proxy are made from. The broker
-# refuses to start without them, and compose builds no image no service runs.
-# Built only when missing: after a change to infra/sandbox or twin_egress, run
-# `make sandbox-image egress-image` in twin-engine.
+# What tenant containers, their egress proxy and coding tasks' boxes are made
+# from. The broker refuses to start without the first two, a task fails on its
+# first box without the third, and compose builds no image no service runs.
+# Built only when missing: after a change to infra/sandbox, twin_egress or
+# sandbox/, run `make sandbox-image egress-image` in twin-engine.
 say "sandbox images"
-for pair in "twin-sandbox:dev sandbox-image" "twin-egress:dev egress-image"; do
+for pair in "twin-sandbox:dev workspace-image" "twin-egress:dev egress-image" "twin-box:dev box-image"; do
   image=${pair% *} target=${pair#* }
   if docker image inspect "$image" >/dev/null 2>&1; then
     ok "$image present"
