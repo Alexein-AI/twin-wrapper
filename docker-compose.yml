@@ -142,6 +142,10 @@ services:
       # Overridable because a provider that refuses a plaintext redirect uri
       # needs this to be an https tunnel for the duration of one connect.
       BASE_URL: ${BASE_URL:-http://localhost:8080}
+      # Where a push is addressed. Only claude-code hands out a callback, and
+      # its pushes come from `engine` on this network, where `localhost` is the
+      # engine itself - so the service name, not BASE_URL.
+      WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-http://backend:8080}
       # The one origin CORS allows and the origin on the event stream. The
       # frontend is in this file now, so this defaults to it rather than to the
       # backend's own /connected page. localhost and 127.0.0.1 are different
