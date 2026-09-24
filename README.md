@@ -24,8 +24,10 @@ Then open <http://localhost:4000>.
 
 Plus what the broker starts on demand: one container per account, holding its
 workspace and its Claude Code sessions, and one egress proxy. Nothing runs on
-this machine outside Docker - the Claude Code agent that did is retired
-(twin-backend ADR 41), and `setup.sh` removes it from a machine that had it.
+this machine outside Docker on this branch - the Claude Code agent that did is
+retired (twin-backend ADR 41). It stays installed while `twin-engine/claude-agent/`
+exists, because `main` and the other repos' `dev` still use it, and `setup.sh`
+removes it only once that directory is gone.
 
 ## How an event becomes a memory
 

@@ -504,8 +504,8 @@ check_host_url "$ENGINE/.env" DATABASE_URL "postgresql+psycopg://twin:twin@local
 
 # --------------------------------------------------------- retired agent ---
 # The Claude Code agent was a host process until twin-engine SANDBOX-PLAN 7.6
-# (twin-backend ADR 41). A machine that installed it keeps two things pointing
-# at files that are gone: a service that restarts on failure, and a hook in the
+# (twin-backend ADR 41). Once `claude-agent/` is deleted, a machine that
+# installed it keeps two things pointing at files that are gone: a service that restarts on failure, and a hook in the
 # Claude Code settings that every tool call in every session runs - a
 # `Cannot find module` each time. Both are removed; nothing else is touched.
 say "the retired host agent"
@@ -565,8 +565,15 @@ retire_hook() {
   ' && ok "removed the old agent's hook from $settings" \
     || { warn "could not rewrite $settings - it is left as it was"; STATUS=1; }
 }
-retire_service
-retire_hook
+# Only once the directory is gone. While it is in twin-engine - on `dev`,
+# and on this branch until the owner decides how a container session is
+# watched - `dev` still runs the agent, and switching back must find it.
+if [ -d "$ENGINE/claude-agent" ]; then
+  ok "twin-engine/claude-agent/ is still here - its agent stays installed for dev"
+else
+  retire_service
+  retire_hook
+fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
   say "check only - nothing was written or installed"
