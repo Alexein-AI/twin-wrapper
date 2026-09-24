@@ -453,6 +453,35 @@ if [ -f "$relay_file" ]; then
       || fatal "could not write twin-backend/.env"
   fi
 fi
+
+# 5. MEMORY_API_SECRET, the bearer twin-memory asks of every store read. Minted
+#    in twin-memory and copied to the engine, its one caller: without it, any
+#    container on the compose network could read any account's memory by naming
+#    it in a header.
+memory_secret="$(env_get "$MEMORY/.env" MEMORY_API_SECRET 2>/dev/null)"
+if [ -z "$memory_secret" ]; then
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "MEMORY_API_SECRET is unset in twin-memory - would mint it"
+    STATUS=1
+  else
+    memory_secret="$(head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_')"
+    env_set "$MEMORY/.env" MEMORY_API_SECRET "$memory_secret" \
+      && ok "minted MEMORY_API_SECRET in twin-memory/.env" \
+      || fatal "could not write twin-memory/.env"
+  fi
+fi
+if [ -n "$memory_secret" ]; then
+  if [ "$(env_get "$ENGINE/.env" MEMORY_API_SECRET 2>/dev/null)" = "$memory_secret" ]; then
+    ok "MEMORY_API_SECRET matches in twin-engine"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "MEMORY_API_SECRET in twin-engine does not match twin-memory's - would copy it"
+    STATUS=1
+  else
+    env_set "$ENGINE/.env" MEMORY_API_SECRET "$memory_secret" \
+      && ok "copied MEMORY_API_SECRET into twin-engine/.env" \
+      || fatal "could not write twin-engine/.env"
+  fi
+fi
 finish_if_fatal
 
 # -------------------------------------------------------------- root env ---
