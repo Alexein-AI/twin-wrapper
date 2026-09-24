@@ -239,19 +239,56 @@ services:
         - action: rebuild
           path: ./twin-connectors/pnpm-lock.yaml
 
+  # Durable execution for the engine (twin-engine production runtime spec
+  # 2026-09-23 §6.1): every chat is a workflow here and every turn an activity,
+  # so a turn survives the process running it. The CLI's dev server with its
+  # SQLite file on a volume - one container and no schema job, which is what a
+  # laptop wants; a deployment points `TEMPORAL_ADDRESS` at a real cluster or
+  # Temporal Cloud and nothing in the engine changes. The UI is loopback-only.
+  temporal:
+    image: temporalio/temporal:1.9.1
+    restart: unless-stopped
+    command:
+      [
+        'server', 'start-dev', '--ip', '0.0.0.0', '--headless=false',
+        '--db-filename', '/home/temporal/temporal.db',
+      ]
+    ports:
+      - '127.0.0.1:${TEMPORAL_UI_PORT:-8233}:8233'
+    # At the user's home and not a subdirectory: the image runs as `temporal`,
+    # and a fresh named volume takes the ownership of the directory it mounts
+    # over - a path the image does not have would be root's.
+    volumes:
+      - twin-temporal-data:/home/temporal
+    healthcheck:
+      test: ['CMD', 'temporal', 'operator', 'cluster', 'health', '--address', 'localhost:7233']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
   # The agent runtime. Its entrypoint creates the database if the server has
   # none and brings the schema to head before uvicorn serves anything, so
   # `twin_engine` needs nothing from the init script beyond existing.
   engine:
     build: ./twin-engine
     restart: unless-stopped
-    # Compose's default is 10s, then SIGKILL. This process waits up to
-    # `shutdown.DEADLINE_SECONDS` for the turns still driving, and anything
-    # under that makes the wait a number nobody honours.
-    stop_grace_period: 45s
+    # The engine's API: `python -m twin_relay`, not the dev harness it ran
+    # until 2026-09-23. It runs no turns - each command signals the thread's
+    # workflow in `temporal`, and `engine-worker` executes it - so it can be
+    # restarted, or scaled, without costing anyone a turn.
+    command: ['uv', 'run', 'python', '-m', 'twin_relay']
     env_file: [./twin-engine/.env]
     environment:
       DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      # Inside its own network namespace, so all interfaces; the host port
+      # below is what stays on loopback. Every route is admitted by the relay
+      # secret alone (`twin_relay.guard.admitted`).
+      TWIN_RELAY_HOST: 0.0.0.0
+      TWIN_RELAY_PORT: '8000'
+      TEMPORAL_ADDRESS: temporal:7233
+      # The live view's stream, the Redis twin-backend reads it from.
+      REDIS_URL: redis://redis:6379
       # Named for the connectors service and pointed at the backend, which is
       # correct and has always been confusing: what this dials is the backend's
       # connector-facing API on 8080, not twin-connectors on 8090.
@@ -279,10 +316,16 @@ services:
     # saying memory was unreachable, which the model can act on.
     extra_hosts:
       - 'host.docker.internal:host-gateway'
-    # 127.0.0.1, not 0.0.0.0: `twin_api` is an unauthenticated dev harness
-    # (spec 7), and publishing it on every interface would serve it to the LAN.
+    # 127.0.0.1: nothing but the backend, on this network, has reason to call
+    # the engine, and the host port is for curl on a laptop.
     ports:
       - '127.0.0.1:${TWIN_API_PORT:-8000}:8000'
+    healthcheck:
+      test: ['CMD', '/app/.venv/bin/python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     volumes:
       # Read-write, and the only host path this container can reach. What keeps
       # one tenant out of another's directory is the jail in
@@ -296,6 +339,8 @@ services:
       - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
     depends_on:
       postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      temporal: { condition: service_healthy }
     # No bind mount - the source is baked into the image - so compose copies an
     # edit in and restarts. The project is an editable install over /app/src,
     # and the restart re-runs the entrypoint, so a new migration is applied too.
@@ -316,6 +361,172 @@ services:
           path: ./twin-engine/pyproject.toml
         - action: rebuild
           path: ./twin-engine/uv.lock
+
+  # The worker: `python -m twin_workflows`, which executes every turn. Scale it
+  # with `docker compose up --scale engine-worker=N`; Temporal hands each chat
+  # to one worker at a time, and a turn whose worker dies is resumed by another
+  # from its checkpoint.
+  engine-worker:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_workflows']
+    # The worker gives running turns `DRAIN` (30s) to finish on SIGTERM, then
+    # leaves the rest RUNNING for the next worker - so this has to be longer.
+    stop_grace_period: 45s
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      CONNECTORS_URL: http://backend:8080
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://host.docker.internal:3000}
+      TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
+      MEMORY_URL: http://memory-api:8000
+      TEMPORAL_ADDRESS: temporal:7233
+      REDIS_URL: redis://redis:6379
+      # The twin's task tools call the engine's API from inside a turn: the
+      # routes that start and steer a coding task are there, not here.
+      TWIN_ENGINE_URL: http://engine:8000
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    volumes:
+      - ${TWIN_ROOT}:${TWIN_ROOT}
+      # The same secret the API reads: it keys the Temporal payload codec, and a
+      # worker holding a different one could not read a single turn.
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    # After the engine, whose entrypoint migrates the schema: two containers
+    # migrating one database at once is a race neither should run.
+    depends_on:
+      engine: { condition: service_healthy }
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./twin-engine/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+        - action: sync+restart
+          path: ./twin-engine/prompts
+          target: /app/prompts
+        - action: rebuild
+          path: ./twin-engine/uv.lock
+
+  # Coding tasks (twin-engine production runtime spec §6.2-6.3). A task runs
+  # dsh in a box of its own - a container from `twin-box:dev`, which
+  # `make sandbox-image` builds in twin-engine - and these five are the box's
+  # world: the worker that drives it, the one path to Docker, the three
+  # things a box can reach on `twin-sandbox`, which has no route out, and the git
+  # proxy a repository is reached through.
+  #
+  # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
+  # touches a box. The only service that reaches Docker, and only through
+  # `docker-proxy`, on a network nothing else joins.
+  code-worker:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code']
+    stop_grace_period: 30s
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      TEMPORAL_ADDRESS: temporal:7233
+      REDIS_URL: redis://redis:6379
+      DOCKER_HOST: tcp://docker-proxy:2375
+      # What the task card links to: the gateway below, on the host port it is
+      # published on. The box id in it is the capability.
+      TWIN_PREVIEW_URL: http://{box}.{port}.preview.localhost:${TWIN_PREVIEW_PORT:-47620}
+      # A repo box's `origin`, and where the worker asks for the account's
+      # GitHub credential to open its draft pull request.
+      TWIN_GIT_PROXY_URL: http://git-proxy:8400
+      TWIN_BACKEND_URL: http://backend:8080
+    networks: [default, docker-api]
+    volumes:
+      # The relay secret: the codec's key, and what box tokens are minted under.
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+      docker-proxy: { condition: service_started }
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./twin-engine/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+
+  # Docker's API, narrowed to what box lifecycle needs: containers, exec,
+  # volumes, and reads of images and networks. No swarm, no secrets, no
+  # plugins, no build. It filters by endpoint and not by payload, so it keeps
+  # a bug in the worker off the rest of the API but does not stop the worker
+  # asking for a privileged container; production runs boxes behind a
+  # provider (spec §6.3), and this is the laptop's stand-in.
+  docker-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      EXEC: 1
+      VOLUMES: 1
+      IMAGES: 1
+      NETWORKS: 1
+      INFO: 1
+      POST: 1
+      ALLOW_START: 1
+      ALLOW_STOP: 1
+      ALLOW_RESTARTS: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [docker-api]
+
+  # Where a box's model calls go: `DEEPSEEK_BASE_URL` in every box. It checks
+  # the box's token, charges the project's live task, refuses past the task's
+  # ceiling, and forwards to OpenRouter with the one real key - which is here
+  # and in no box.
+  llm-proxy:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code.llm_proxy']
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+    networks: [default, twin-sandbox]
+    volumes:
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+
+  # A repo box's `origin`: its own repository only, its own task's branch only,
+  # with the account's GitHub credential put on here and never in the box.
+  git-proxy:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code.git_proxy']
+    env_file: [./twin-engine/.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      TWIN_BACKEND_URL: http://backend:8080
+    networks: [default, twin-sandbox]
+    volumes:
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
+      engine: { condition: service_healthy }
+
+  # A box's only route to the internet: package registries and GitHub reads
+  # (`twin-engine/sandbox/egress/squid.conf` says which, and why).
+  egress:
+    image: ubuntu/squid:6.13-25.04_beta
+    restart: unless-stopped
+    volumes:
+      - ./twin-engine/sandbox/egress/squid.conf:/etc/squid/squid.conf:ro
+    networks: [default, twin-sandbox]
+
+  # The preview gateway: `http://<box>.<port>.preview.localhost:47620` is what
+  # box <box> serves on <port>. Published on loopback; `*.localhost` resolves
+  # there in every browser, so it needs no DNS.
+  preview:
+    image: caddy:2.11.4
+    restart: unless-stopped
+    volumes:
+      - ./twin-engine/sandbox/preview/Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - '127.0.0.1:${TWIN_PREVIEW_PORT:-47620}:80'
+    networks: [default, twin-sandbox]
 
   frontend:
     build:
@@ -554,6 +765,10 @@ volumes:
   # so losing this loses everything the twin remembers that is not still in
   # twin-backend's `events` table.
   twin-memory-store:
+  # Temporal's history: every chat's queue, pending approval and timers.
+  # Losing it loses what in-flight chats were waiting on, never their messages,
+  # which are in the engine's database.
+  twin-temporal-data:
 
 # Pinned off 172.19/16, which is this office's LAN (172.19.2.0/23). Compose's
 # default pick swallowed it once: every container routed 172.19.2.202 onto its
@@ -563,3 +778,15 @@ networks:
     ipam:
       config:
         - subnet: ${TWIN_SUBNET:-10.201.0.0/16}
+  # Where boxes live. Internal: no gateway, so a box reaches `egress`,
+  # `llm-proxy` and `preview` by name and nothing else at all. Named, because
+  # the code worker creates boxes on it by that name.
+  twin-sandbox:
+    name: twin-sandbox
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TWIN_SANDBOX_SUBNET:-10.202.0.0/16}
+  # The code worker and the Docker API proxy, and nothing else.
+  docker-api:
+    internal: true
