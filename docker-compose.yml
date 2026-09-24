@@ -75,7 +75,7 @@ services:
       # is what twin-backend's integration suite asserts against.
       POSTGRES_INITDB_ARGS: '--locale=C --encoding=UTF8'
     ports:
-      - '${POSTGRES_PORT:-5500}:5432'
+      - '127.0.0.1:${POSTGRES_PORT:-5500}:5432'
     volumes:
       - twin-postgres-data:/var/lib/postgresql/data
       # Read-only, and read exactly once: the image runs this directory only
@@ -107,9 +107,16 @@ services:
     # The old failure mode is still real, so it moved rather than vanished:
     # resetting Postgres means flushing Redis in the same breath.
     #   docker compose down -v      (both, together, which is the safe order)
+    #
+    # But `-v` is every named volume, and that includes `twin-memory-store`:
+    # the only copy of every account's memory, paid cards included. Back it up
+    # first (twin-memory RUNBOOK.md, "Backup"), or remove just the two you mean:
+    #   docker compose down && docker volume rm twin_twin-postgres-data twin_twin-redis-data
     command: ['redis-server', '--appendonly', 'yes']
     ports:
-      - '${REDIS_PORT:-6500}:6379'
+      # Loopback: nothing authenticates a Redis client, and the account an
+      # event is filed under is whatever the message says.
+      - '127.0.0.1:${REDIS_PORT:-6500}:6379'
     volumes:
       - twin-redis-data:/data
     healthcheck:
@@ -604,6 +611,12 @@ services:
   memory-consumer:
     build: ./twin-memory
     restart: unless-stopped
+    # An init as PID 1, so SIGTERM reaches Python as a signal it handles: the
+    # batch in hand finishes and is acknowledged, then the process exits. The
+    # grace period is that batch plus a fold; past it the kill is still safe,
+    # because an unacknowledged batch is requeued on the next start.
+    init: true
+    stop_grace_period: 60s
     # `--card-every 10` turns on the one paid stage on the write path: every
     # tenth batch, and again whenever the queue goes quiet, threads that have
     # settled are carded. Without it a live store accumulates threads no card
@@ -624,10 +637,30 @@ services:
       # the mlx backend the Makefile mentions is Apple-silicon-only and cannot
       # run in this Linux container at all.
       TWIN_EMBEDDER: ${TWIN_EMBEDDER:-none}
+      # What the card rhythm may spend in a UTC day, tracked in Redis so a
+      # restart does not reset it. Unset is no ceiling.
+      MEMORY_DAILY_BUDGET_USD: ${MEMORY_DAILY_BUDGET_USD:-5}
+      # The reply cache is for benchmark re-runs. A live twin must not be
+      # handed yesterday's card for today's thread, and the cache would grow in
+      # this container's writable layer until it was recreated.
+      LLM_CACHE: 'off'
     volumes:
       - twin-memory-store:/var/twin/store
     depends_on:
       redis: { condition: service_healthy }
+    # Alive means it said so within the last minute: `QueueFeed.beat` sets the
+    # key with a 60s expiry on every pass, busy or idle. A wedged loop stops
+    # beating while the process stays up, which no process check would see.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import sys; from consumer.queue import HEARTBEAT, connect;
+          sys.exit(0 if connect(timeout=3).exists(HEARTBEAT) else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     # Source is baked, not mounted: compose copies an edit in and restarts.
     # `consumer` and `twin_db` are found through PYTHONPATH=/app/src, so a
     # synced file is what runs without reinstalling anything.
@@ -667,6 +700,11 @@ services:
       TWIN_HOST: 0.0.0.0
       TWIN_PORT: 8000
       TWIN_EMBEDDER: ${TWIN_EMBEDDER:-none}
+      # A request that names no account is a 400, not an answer from the shared
+      # default store. The default store answering was how every twin read an
+      # empty memory while the consumer filed each account's events under its
+      # own id. MEMORY_API_SECRET comes from twin-memory/.env (setup.sh mints it).
+      TWIN_REQUIRE_ACCOUNT: '1'
     ports:
       - '127.0.0.1:${MEMORY_API_PORT:-8200}:8000'
     depends_on:
