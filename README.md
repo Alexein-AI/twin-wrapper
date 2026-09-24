@@ -22,9 +22,10 @@ Then open <http://localhost:4000>.
 | `postgres` | `localhost:5500` | one server, one database per repo |
 | `redis` | `localhost:6500` | queues, rate limits, and the event list |
 
-Plus one process that is **not** a container and cannot be: the Claude Code
-agent. It drives tmux and reads `~/.claude` on this machine, so `setup.sh`
-installs it as a launch agent and it starts at login.
+Plus what the broker starts on demand: one container per account, holding its
+workspace and its Claude Code sessions, and one egress proxy. Nothing runs on
+this machine outside Docker - the Claude Code agent that did is retired
+(twin-backend ADR 41), and `setup.sh` removes it from a machine that had it.
 
 ## How an event becomes a memory
 
@@ -68,7 +69,7 @@ container exists — a volume path, a published port, a build argument. See
 [.env.example](.env.example). `./setup.sh` writes it.
 
 Values that cannot be copied between machines — the relay secret, the shared
-`CONNECTORS_SECRET`, the agent's pairing token — are minted by `setup.sh`,
+`CONNECTORS_SECRET`, the sandbox broker's two tokens — are minted by `setup.sh`,
 because a copied secret is not a missing one. It is a wrong one, and every
 engine route answers 401 without saying why.
 
@@ -109,7 +110,6 @@ docker compose down -v                    # stop and drop the databases and the 
 docker compose --profile tunnel-named up -d   # a public url for inbound webhooks
 
 ./setup.sh --check                        # what is missing, changing nothing
-./setup.sh --pair                         # the agent's 2-minute pairing window
 ```
 
 ## Two steps no script can do
@@ -117,9 +117,9 @@ docker compose --profile tunnel-named up -d   # a public url for inbound webhook
 1. **Sign in** at <http://localhost:4000>. Identity is Clerk's (ADR 37), so this
    is a browser sign-in with no terminal equivalent: the connect route and
    minting a `twk_` key are both behind `requireViewer`.
-2. **Pair Claude Code.** Open <http://localhost:4000/connections>, run
-   `./setup.sh --pair`, and press Connect within two minutes. The agent mints
-   its own token during that claim; nothing is pasted.
+2. **Connect Claude Code** from <http://localhost:4000/connections>: sign the
+   container in to your own Anthropic account, then Connect. It pairs with a
+   one-time password the engine issues once the login lands; nothing is pasted.
 
 ## Ports
 
