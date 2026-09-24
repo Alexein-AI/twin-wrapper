@@ -261,13 +261,14 @@ services:
       # connector-facing API on 8080, not twin-connectors on 8090.
       CONNECTORS_URL: http://backend:8080
       # Langfuse is not in this file - it is its own stack under infra/langfuse
-      # - so it is still reached across the host.
+      # - so it is still reached across the host. Docker Desktop resolves the
+      # name by itself; a Linux engine does not, so set LANGFUSE_HOST there.
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://host.docker.internal:3000}
-      # One root for every tenant: `<TWIN_ROOT>/<company>/<account>`. Mounted
-      # below at the same absolute path it has on the host, which is the whole
-      # trick: a `cwd` the twin passes to `sessions.spawn` is a host path to the
-      # Claude Code agent and a container path in here, and they have to be the
-      # same string or every spawn lands somewhere that does not exist.
+      # One root for every tenant: `<TWIN_ROOT>/<company>/<account>`. A string
+      # and not a mount (twin-backend ADR 41): each workspace is a volume in
+      # its account's own container, at this path, and this container has none
+      # of them. The broker and the backend are handed the same string, since
+      # a session's `cwd` crosses all three.
       TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
       # The other half of the same relationship, in the other direction: where
       # this person's history is read from. It is dialled by the *twin* and no
@@ -288,22 +289,15 @@ services:
     # Deliberately not a `depends_on`: a memory service that is down must cost
     # a lookup and not the engine's boot. Each lookup degrades to a sentence
     # saying memory was unreachable, which the model can act on.
-    extra_hosts:
-      - 'host.docker.internal:host-gateway'
+    #
+    # No `extra_hosts` and no volumes, the `~/.twin-relay` mount included: the
+    # relay secret arrives as TWIN_RELAY_SECRET from twin-engine/.env, where
+    # ./setup.sh copies it. All three were a turn's reach while `execute` ran
+    # in here (twin-engine SANDBOX-PLAN F2, F4, F5), and nothing does now.
     # 127.0.0.1, not 0.0.0.0: `twin_api` is an unauthenticated dev harness
     # (spec 7), and publishing it on every interface would serve it to the LAN.
     ports:
       - '127.0.0.1:${TWIN_API_PORT:-8000}:8000'
-    volumes:
-      # Read-write, and the only host path this container can reach. What keeps
-      # one tenant out of another's directory is the jail in
-      # `agent_runtime/tenancy.py`, not this mount.
-      #
-      # No `~/.twin-relay` mount any more: the relay secret arrives as
-      # TWIN_RELAY_SECRET from twin-engine/.env, where ./setup.sh copies it. A
-      # mounted file was readable by `execute`; the app's environment is not
-      # (twin-engine SANDBOX-PLAN F2).
-      - ${TWIN_ROOT}:${TWIN_ROOT}
     depends_on:
       postgres: { condition: service_healthy }
     # No bind mount - the source is baked into the image - so compose copies an
