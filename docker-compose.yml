@@ -330,6 +330,10 @@ services:
       # minted there by ./setup.sh: a value in two files is two values.
       TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
       TWIN_SANDBOX_AUDIT_TOKEN: ${TWIN_SANDBOX_AUDIT_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_AUDIT_TOKEN}
+      # What the coding boxes' proxies present, and where this process fetches
+      # an account's GitHub credential on their behalf (SANDBOX-PLAN phase 8).
+      TWIN_BOX_PROXY_TOKEN: ${TWIN_BOX_PROXY_TOKEN:?run ./setup.sh - it mints TWIN_BOX_PROXY_TOKEN}
+      TWIN_BACKEND_URL: http://backend:8080
     # Deliberately not a `depends_on`: a memory service that is down must cost
     # a lookup and not the engine's boot. Each lookup degrades to a sentence
     # saying memory was unreachable, which the model can act on.
@@ -533,12 +537,18 @@ services:
   llm-proxy:
     build: ./twin-engine
     restart: unless-stopped
+    # The image's entrypoint provisions a database this process never opens.
+    entrypoint: []
     command: ['uv', 'run', 'python', '-m', 'twin_code.llm_proxy']
-    env_file: [./twin-engine/.env]
+    # No `env_file`, and that is the point (twin-engine SANDBOX-PLAN phase 8): a
+    # box can open a socket to this, so it holds the model key and the engine's
+    # box bearer and nothing else - no database, no relay secret, no broker
+    # token. What it needs to know about a box it asks the engine.
     environment:
-      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
+      OPENROUTER_KEY: ${OPENROUTER_KEY:?run ./setup.sh - it copies OPENROUTER_KEY here from twin-engine/.env}
+      TWIN_BOX_PROXY_TOKEN: ${TWIN_BOX_PROXY_TOKEN:?run ./setup.sh - it mints TWIN_BOX_PROXY_TOKEN}
+      TWIN_ENGINE_URL: http://engine:8000
     networks: [default, twin-sandbox]
-    # The relay secret is TWIN_RELAY_SECRET from twin-engine/.env, as above.
     depends_on:
       engine: { condition: service_healthy }
 
@@ -547,13 +557,14 @@ services:
   git-proxy:
     build: ./twin-engine
     restart: unless-stopped
+    entrypoint: []
     command: ['uv', 'run', 'python', '-m', 'twin_code.git_proxy']
-    env_file: [./twin-engine/.env]
+    # The engine's box bearer and nothing else, as on `llm-proxy`: the engine
+    # checks the box's token and fetches the account's GitHub credential.
     environment:
-      DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
-      TWIN_BACKEND_URL: http://backend:8080
+      TWIN_BOX_PROXY_TOKEN: ${TWIN_BOX_PROXY_TOKEN:?run ./setup.sh - it mints TWIN_BOX_PROXY_TOKEN}
+      TWIN_ENGINE_URL: http://engine:8000
     networks: [default, twin-sandbox]
-    # The relay secret is TWIN_RELAY_SECRET from twin-engine/.env, as above.
     depends_on:
       engine: { condition: service_healthy }
 

@@ -480,9 +480,10 @@ else
 fi
 
 # The broker's two tokens: the engine presents one to it, it presents the other
-# back. The root compose names both in `engine` and in `sandbox-broker`, so this
-# file is their one copy. Minted once, then kept.
-for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN; do
+# back. And the coding boxes' proxies' bearer, which they present to the engine
+# (twin-engine SANDBOX-PLAN phase 8). The root compose names each where it is
+# used, so this file is their one copy. Minted once, then kept.
+for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN TWIN_BOX_PROXY_TOKEN; do
   if env_has "$ROOT/.env" "$key"; then
     ok "$key present"
   elif [ "$CHECK_ONLY" -eq 1 ]; then
@@ -491,6 +492,23 @@ for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN; do
     env_set "$ROOT/.env" "$key" "$(new_secret)" && ok "minted $key"
   fi
 done
+
+# The model key, for `llm-proxy` alone. Copied rather than loaded with
+# `env_file`: a box can open a socket to that proxy, so it gets this key and its
+# bearer and none of the rest of twin-engine/.env. Kept in step on every run,
+# since twin-engine/.env is where the key is changed.
+model_key="$(env_get "$ENGINE/.env" OPENROUTER_KEY 2>/dev/null)"
+if [ -z "$model_key" ]; then
+  warn "no OPENROUTER_KEY in twin-engine/.env - coding tasks cannot reach a model"
+elif [ "$(env_get "$ROOT/.env" OPENROUTER_KEY 2>/dev/null)" = "$model_key" ]; then
+  ok "OPENROUTER_KEY matches twin-engine/.env"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "OPENROUTER_KEY in the root .env is missing or stale - would copy it from twin-engine/.env"
+  STATUS=1
+else
+  env_set "$ROOT/.env" OPENROUTER_KEY "$model_key" \
+    && ok "copied OPENROUTER_KEY into the root .env for llm-proxy"
+fi
 
 # ------------------------------------------------------------ sandbox images ---
 # What tenant containers, their egress proxy and coding tasks' boxes are made
