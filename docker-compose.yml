@@ -206,10 +206,10 @@ services:
       REDIS_URL: redis://redis:6379
       PROVIDER_CONFIG_DIR: /app/config/providers
       CONNECTORS_PORT: 8090
-      # The Claude Code agent is a host process - it drives tmux and reads
-      # ~/.claude on this machine, so no container can hold it. This is Docker's
-      # alias for the host, so the request still never leaves it.
-      CLAUDE_CODE_BASE_URL: ${CLAUDE_CODE_BASE_URL:-http://host.docker.internal:47600}
+      # The claude-code agent is the engine (twin-engine SANDBOX-PLAN phase 7),
+      # reached where it publishes on the host: twin-connectors admits plain
+      # http only to a loopback name, and `engine` is not one.
+      CLAUDE_CODE_BASE_URL: ${CLAUDE_CODE_BASE_URL:-http://host.docker.internal:${TWIN_API_PORT:-8000}/claude-code}
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     volumes:
