@@ -274,6 +274,13 @@ services:
       # Unset is a real state: the twin then answers out of its connectors and
       # its conversation, and binds no memory tools at all.
       MEMORY_URL: http://memory-api:8000
+      # The broker below, on this network. Pinned here rather than read from
+      # twin-engine/.env, which spells it for `make api` on the host.
+      TWIN_SANDBOX_BROKER_URL: http://sandbox-broker:8766
+      # Shared with `sandbox-broker`, so named once, in the root .env, and
+      # minted there by ./setup.sh: a value in two files is two values.
+      TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
+      TWIN_SANDBOX_AUDIT_TOKEN: ${TWIN_SANDBOX_AUDIT_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_AUDIT_TOKEN}
     # Deliberately not a `depends_on`: a memory service that is down must cost
     # a lookup and not the engine's boot. Each lookup degrades to a sentence
     # saying memory was unreachable, which the model can act on.
@@ -287,13 +294,12 @@ services:
       # Read-write, and the only host path this container can reach. What keeps
       # one tenant out of another's directory is the jail in
       # `agent_runtime/tenancy.py`, not this mount.
+      #
+      # No `~/.twin-relay` mount any more: the relay secret arrives as
+      # TWIN_RELAY_SECRET from twin-engine/.env, where ./setup.sh copies it. A
+      # mounted file was readable by `execute`; the app's environment is not
+      # (twin-engine SANDBOX-PLAN F2).
       - ${TWIN_ROOT}:${TWIN_ROOT}
-      # The relay secret, read-only. `load_secret` mints one where it finds
-      # none, so without this the container mints its own and every call from
-      # the backend - which holds the host's copy in TWIN_ENGINE_SECRET -
-      # answers 401. Mounted rather than passed, because the loader reads a file
-      # and takes no environment variable. `./setup.sh` mints the host's copy.
-      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
     depends_on:
       postgres: { condition: service_healthy }
     # No bind mount - the source is baked into the image - so compose copies an
@@ -316,6 +322,44 @@ services:
           path: ./twin-engine/pyproject.toml
         - action: rebuild
           path: ./twin-engine/uv.lock
+
+  # The sandbox broker: the one process that may hold the Docker socket, so the
+  # only one that can create a tenant container (twin-engine SANDBOX-PLAN).
+  # The engine reaches it here, never the socket.
+  #
+  # The engine's image as a different process, and deliberately not its
+  # environment: no `env_file`, so the model key, the database url and the
+  # relay secret are not in this container at all.
+  sandbox-broker:
+    build: ./twin-engine
+    restart: unless-stopped
+    # The image's entrypoint provisions a database this process never opens.
+    entrypoint: []
+    command: ['uv', 'run', 'python', '-m', 'twin_sandbox']
+    # Root, and honestly: anything that can reach the socket is root on the
+    # host already, and the image's own user cannot open it.
+    user: '0:0'
+    environment:
+      TWIN_SANDBOX_HOST: 0.0.0.0
+      TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
+      # Built by ./setup.sh (`make sandbox-image egress-image` in twin-engine).
+      TWIN_SANDBOX_IMAGE: ${TWIN_SANDBOX_IMAGE:-twin-sandbox:dev}
+      TWIN_EGRESS_IMAGE: ${TWIN_EGRESS_IMAGE:-twin-egress:dev}
+      # The string a workspace path is built from, not a mount: the broker names
+      # the path inside a tenant container where that account's volume goes.
+      TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
+      # The hosts a sandbox may reach. twin-engine/docker-compose.yml has the
+      # reasoning for each; add one by reading what the proxy refused.
+      TWIN_EGRESS_ALLOWLIST: ${TWIN_EGRESS_ALLOWLIST:-api.anthropic.com,platform.claude.com,.pypi.org,.pythonhosted.org,.npmjs.org,.github.com}
+      TWIN_SANDBOX_AUDIT_URL: http://engine:8000
+      TWIN_SANDBOX_AUDIT_TOKEN: ${TWIN_SANDBOX_AUDIT_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_AUDIT_TOKEN}
+      # Off 172.19/16 and off TWIN_SUBNET below; twin-engine/docs/ports.md is
+      # the register.
+      TWIN_SANDBOX_NETWORK_POOL: ${TWIN_SANDBOX_NETWORK_POOL:-10.204.0.0/16}
+      TWIN_EGRESS_SUBNET: ${TWIN_EGRESS_SUBNET:-10.203.0.0/24}
+    volumes:
+      # Here and nowhere else. `engine` must never grow this line.
+      - /var/run/docker.sock:/var/run/docker.sock
 
   frontend:
     build:

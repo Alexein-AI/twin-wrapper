@@ -20,10 +20,10 @@
 #      must hold as TWIN_ENGINE_SECRET, and the agent's own, which pairing
 #      exchanges. A copied value is not a missing value - it is a wrong one, and
 #      every engine route answers 401 without saying why.
-#   2. The relay secret has to exist *before* the engine container starts,
-#      because compose mounts ~/.twin-relay read-only: the minting code in
-#      twin_relay/secret.py writes where it finds nothing, and in there it finds
-#      nothing and cannot write.
+#   2. The relay secret reaches the engine as TWIN_RELAY_SECRET in its .env,
+#      copied there from ~/.twin-relay/secret like the backend's copy. It was a
+#      read-only mount until the sandbox work, and a mounted file is readable
+#      by `execute` where the app's environment is not.
 #   3. The Claude Code agent is a host process. It drives tmux and reads
 #      ~/.claude on this machine, so no container can hold it and `docker
 #      compose build` has nothing to say about it.
@@ -164,6 +164,15 @@ expand_home() {
     '~/'*) printf '%s%s' "$HOME" "${1#\~}" ;;
     *) printf '%s' "$1" ;;
   esac
+}
+
+# A url-safe random secret: 32 bytes, base64url, no padding.
+new_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32 | tr -d '\n=' | tr '+/' '-_'
+  else
+    head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_'
+  fi
 }
 
 # ----------------------------------------------------------------- repos ---
@@ -410,10 +419,8 @@ else
   fi
 fi
 
-# 3. The relay secret, minted here rather than by the engine: compose mounts
-#    ~/.twin-relay read-only, so in the container the minting code finds nothing
-#    and cannot write. The host path is what varies between instances; inside,
-#    it is always /root.
+# 3. The relay secret, minted here rather than by the engine, which would mint
+#    one of its own that nothing else holds.
 relay_dir="$(expand_home "$(env_get "$ENGINE/.env" TWIN_RELAY_DIR 2>/dev/null || echo "$HOME/.twin-relay")")"
 [ -n "$relay_dir" ] || relay_dir="$HOME/.twin-relay"
 relay_file="$relay_dir/secret"
@@ -428,11 +435,7 @@ else
   # twin_relay/secret.py does, and for the same reason. The umask is scoped to
   # the subshell rather than set here, where it would follow every later file.
   (umask 077 && : >"$relay_file")
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 32 | tr -d '\n=' | tr '+/' '-_' >"$relay_file"
-  else
-    head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_' >"$relay_file"
-  fi
+  new_secret >"$relay_file"
   chmod 600 "$relay_file"
   ok "minted the relay secret at $relay_file"
 fi
@@ -451,6 +454,21 @@ if [ -f "$relay_file" ]; then
     env_set "$BACKEND/.env" TWIN_ENGINE_SECRET "$relay_secret" \
       && ok "copied the relay secret into twin-backend/.env as TWIN_ENGINE_SECRET" \
       || fatal "could not write twin-backend/.env"
+  fi
+fi
+
+# 5. And the engine's, which it reads from its environment. A stale one fails
+#    the same way: every command route answers 401.
+if [ -f "$relay_file" ]; then
+  if [ "$(env_get "$ENGINE/.env" TWIN_RELAY_SECRET 2>/dev/null)" = "$relay_secret" ]; then
+    ok "TWIN_RELAY_SECRET matches the relay secret"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "TWIN_RELAY_SECRET in twin-engine/.env does not match $relay_file - would copy it across"
+    STATUS=1
+  else
+    env_set "$ENGINE/.env" TWIN_RELAY_SECRET "$relay_secret" \
+      && ok "copied the relay secret into twin-engine/.env as TWIN_RELAY_SECRET" \
+      || fatal "could not write twin-engine/.env"
   fi
 fi
 finish_if_fatal
@@ -482,6 +500,39 @@ else
     info "no CLOUDFLARE_TUNNEL_TOKEN - the tunnel profiles stay off, which is the default"
   fi
 fi
+
+# The broker's two tokens: the engine presents one to it, it presents the other
+# back. The root compose names both in `engine` and in `sandbox-broker`, so this
+# file is their one copy. Minted once, then kept.
+for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN; do
+  if env_has "$ROOT/.env" "$key"; then
+    ok "$key present"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "no $key in the root .env - would mint it"
+  else
+    env_set "$ROOT/.env" "$key" "$(new_secret)" && ok "minted $key"
+  fi
+done
+
+# ------------------------------------------------------------ sandbox images ---
+# What tenant containers and their egress proxy are made from. The broker
+# refuses to start without them, and compose builds no image no service runs.
+# Built only when missing: after a change to infra/sandbox or twin_egress, run
+# `make sandbox-image egress-image` in twin-engine.
+say "sandbox images"
+for pair in "twin-sandbox:dev sandbox-image" "twin-egress:dev egress-image"; do
+  image=${pair% *} target=${pair#* }
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    ok "$image present"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "no $image - would build it (make $target in twin-engine)"
+  elif (cd "$ENGINE" && make "$target" >/dev/null 2>&1); then
+    ok "built $image"
+  else
+    fatal "could not build $image - run make $target in twin-engine"
+  fi
+done
+finish_if_fatal
 
 # The host-side spellings, which compose overrides for every container but
 # `make run` and `make api` still read. Warned rather than rewritten: which
