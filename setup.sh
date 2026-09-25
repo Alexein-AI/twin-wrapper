@@ -5,6 +5,8 @@
 #   ./setup.sh --check      report only; nothing is written or installed
 #   ./setup.sh --no-agent   skip the Claude Code agent entirely
 #   ./setup.sh --pair       open the agent's 2-minute pairing window, nothing else
+#   ./setup.sh --root=DIR   set up that tree instead of this one (staging/ uses it)
+#   ./setup.sh --branch=B   the branch those checkouts are expected on (default dev)
 #   ./setup.sh --help
 #
 # Then, and every time after that:
@@ -42,23 +44,38 @@ case "${1:-}" in
     ;;
 esac
 
+# The tree being set up. `$(dirname "$0")` by default, which is the dev
+# checkout beside this script - `--root <dir>` points it at another instance's.
+# staging/ runs *this* script against its own directory rather than keeping a
+# copy that drifts, and everything below is derived from ROOT, so that is the
+# only line that has to know.
 cd "$(dirname "$0")" || exit 1
 ROOT="$(pwd)"
 
 CHECK_ONLY=0
 WITH_AGENT=1
 PAIR_ONLY=0
+WANT_ROOT=
+# What the five checkouts are expected to be on. dev here, staging in staging/.
+EXPECT_BRANCH=dev
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
     --no-agent) WITH_AGENT=0 ;;
     --pair) PAIR_ONLY=1 ;;
+    --root=*) WANT_ROOT="${arg#--root=}" ;;
+    --branch=*) EXPECT_BRANCH="${arg#--branch=}" ;;
     *)
       echo "setup: unknown option $arg (try --help)" >&2
       exit 1
       ;;
   esac
 done
+
+if [ -n "$WANT_ROOT" ]; then
+  cd "$WANT_ROOT" 2>/dev/null || { echo "setup: no such directory: $WANT_ROOT" >&2; exit 1; }
+  ROOT="$(pwd)"
+fi
 
 # Colour only on a terminal, so a piped log stays clean.
 if [ -t 1 ]; then
@@ -169,12 +186,14 @@ expand_home() {
 # ----------------------------------------------------------------- repos ---
 say "repositories"
 for d in twin-backend twin-connectors twin-engine twin-frontend twin-memory; do
-  if [ -d "$ROOT/$d/.git" ]; then
+  # `-e`, not `-d`: a git worktree's `.git` is a file holding a `gitdir:`
+  # pointer, and staging's four checkouts are worktrees of these same repos.
+  if [ -e "$ROOT/$d/.git" ]; then
     branch="$(cd "$ROOT/$d" && git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     ok "$d  ($branch)"
     # Not fatal: a fork or a release branch is legitimate. Said out loud because
     # "I cloned the dev branches" and "I am on the dev branches" have come apart.
-    [ "$branch" = "dev" ] || warn "  ^ not on dev"
+    [ "$branch" = "$EXPECT_BRANCH" ] || warn "  ^ not on $EXPECT_BRANCH"
   else
     fatal "$d is missing from $ROOT"
     add_todo "clone $d into $ROOT"
@@ -314,6 +333,27 @@ require_value "$FRONTEND/.env.local" CLERK_SECRET_KEY "twin-frontend/.env.local"
   "the server half needs it too"
 require_value "$FRONTEND/.env.local" TWIN_PUBLIC_URL "twin-frontend/.env.local" \
   "the frontend's own public origin, which it sends as returnTo when you press Connect"
+# Not the same name as the engine's OPENROUTER_KEY, and not interchangeable.
+# The consumer is started with `--card-every`, which exits at startup without a
+# key - so compose restarts it forever and the only symptom is a service that
+# never settles. A fresh .env from .env.example has never had this.
+require_value "$MEMORY/.env" OPENROUTER_API_KEY "twin-memory/.env" \
+  "the consumer runs with --card-every and exits at startup without it"
+
+# Optional, and said out loud anyway: an absent key costs one capability rather
+# than the stack, so this warns where the others are fatal. `web_tools` drops
+# `web_search` and keeps `web_fetch`, so the twin answers "I cannot perform a
+# web search" - which is honest, and reads from the chat exactly like a bug.
+optional_value() {
+  if env_has "$1" "$2"; then
+    ok "$3 $2"
+  else
+    warn "$3 $2 is empty - $4"
+    add_todo "set $2 in $3 to get $2's capability back"
+  fi
+}
+optional_value "$ENGINE/.env" BRAVE_API_KEY "twin-engine/.env" \
+  "the twin binds web_fetch but no web_search, and says so when asked to search"
 
 # One origin in two repos. The frontend sends `<TWIN_PUBLIC_URL>/connections` as
 # `returnTo`; `safeReturnTo` in the backend refuses any origin that is not
@@ -558,16 +598,25 @@ fi
 
 # ------------------------------------------------------------------ done ---
 say "set up"
-cat <<'EOF'
+# Read back rather than hardcoded, because a second instance moves every one of
+# them: printing dev's ports after setting up staging sends the tester to a
+# frontend that is not the one just built.
+p_front="$(env_get "$ROOT/.env" FRONTEND_PORT 2>/dev/null)"; : "${p_front:=4000}"
+p_api="$(env_get "$ROOT/.env" API_PORT 2>/dev/null)"; : "${p_api:=8080}"
+p_engine="$(env_get "$ROOT/.env" TWIN_API_PORT 2>/dev/null)"; : "${p_engine:=8000}"
+p_mem="$(env_get "$ROOT/.env" MEMORY_API_PORT 2>/dev/null)"; : "${p_mem:=8200}"
+p_pg="$(env_get "$ROOT/.env" POSTGRES_PORT 2>/dev/null)"; : "${p_pg:=5500}"
+p_redis="$(env_get "$ROOT/.env" REDIS_PORT 2>/dev/null)"; : "${p_redis:=6500}"
+cat <<EOF
     docker compose up -d        <- the whole stack, from here
 
-    frontend    http://localhost:4000      open this one
-    backend     http://localhost:8080
-    engine      http://127.0.0.1:8000      unauthenticated dev harness, loopback only
-    memory      http://127.0.0.1:8200      retrieval only, loopback only
+    frontend    http://localhost:$p_front      open this one
+    backend     http://localhost:$p_api
+    engine      http://127.0.0.1:$p_engine      unauthenticated dev harness, loopback only
+    memory      http://127.0.0.1:$p_mem      retrieval only, loopback only
     connectors  connectors:8090            no host port, by design
-    postgres    localhost:5500             twin_backend / twin_engine / twin_memory
-    redis       localhost:6500
+    postgres    localhost:$p_pg             twin_backend / twin_engine / twin_memory
+    redis       localhost:$p_redis
 EOF
 echo
 printf '%sthe two steps a script cannot do for you:%s\n' "$BLU" "$OFF"

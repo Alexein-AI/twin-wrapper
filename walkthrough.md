@@ -96,19 +96,23 @@ The service definitions are at
  │ temporal  llm-proxy  git-proxy  egress  preview                          │
  └──────────────────────────────────────────────────────────────────────────┘
         │                                   │
-        │ docker-api (internal)             │ twin-sandbox (internal, 10.202/16)
+        │ docker-api (internal)             │ twin-sandbox (internal, 10.202/16 default)
         │ code-worker ⇄ docker-proxy only   │ boxes ⇄ llm-proxy, git-proxy, egress, preview
         ▼                                   ▼
    Docker socket                     twinbox-<hex> containers
 ```
 
-- **`twin-sandbox`** ([docker-compose.yml:784](docker-compose.yml#L784)) is
+- **`twin-sandbox`** ([docker-compose.yml:822](docker-compose.yml#L822)) is
   marked `internal: true`. Docker gives an internal network **no gateway**: a
   container on it can reach other containers on it by name, and nothing else.
   No internet, no host, no Postgres. The four control-plane services
   (`llm-proxy`, `git-proxy`, `egress`, `preview`) sit on **both** this network
-  and `default`, so they are the only bridges out.
-- **`docker-api`** ([docker-compose.yml:791](docker-compose.yml#L791)) is
+  and `default`, so they are the only bridges out. Its subnet is
+  `TWIN_SANDBOX_SUBNET`, defaulting to `10.202.0.0/16`. Set it when another
+  compose project on the machine already holds that pool - the staging stack's
+  default network does - or `up` dies on `invalid pool request: Pool overlaps
+  with other one on this address space` before a single container starts.
+- **`docker-api`** ([docker-compose.yml:829](docker-compose.yml#L829)) is
   internal too, and holds only `code-worker` and `docker-proxy`. So nothing
   else can even reach the Docker API.
 - **`default`** is everything else.

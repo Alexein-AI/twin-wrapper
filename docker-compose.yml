@@ -443,6 +443,10 @@ services:
       # GitHub credential to open its draft pull request.
       TWIN_GIT_PROXY_URL: http://git-proxy:8400
       TWIN_BACKEND_URL: http://backend:8080
+      # The same value the network below is named with. `twin_code/settings.py`
+      # defaults it to `twin-sandbox`, which is right for a single instance and
+      # wrong the moment a second one exists.
+      TWIN_BOX_NETWORK: ${TWIN_BOX_NETWORK:-twin-sandbox}
     networks: [default, docker-api]
     volumes:
       # The relay secret: the codec's key, and what box tokens are minted under.
@@ -850,7 +854,13 @@ networks:
   # `llm-proxy` and `preview` by name and nothing else at all. Named, because
   # the code worker creates boxes on it by that name.
   twin-sandbox:
-    name: twin-sandbox
+    # Host-global, so it is the one name two instances of this stack cannot
+    # share: a network name is claimed once per daemon, and the second project
+    # to come up fails on it. Dev leaves it alone; staging sets
+    # TWIN_BOX_NETWORK to a name of its own. The worker below is told the same
+    # value, because it creates boxes on this network *by name* and a box on
+    # the wrong one reaches the wrong stack's proxies.
+    name: ${TWIN_BOX_NETWORK:-twin-sandbox}
     internal: true
     ipam:
       config:
