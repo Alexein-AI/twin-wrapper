@@ -458,6 +458,9 @@ services:
       # where turns run, so this is what reaches the broker for them.
       TWIN_SANDBOX_BROKER_URL: http://sandbox-broker:8766
       TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
+      # The link `preview_page` hands the person for a page the twin serves
+      # out of its own container: the gateway below, as `code-worker` has it.
+      TWIN_PREVIEW_URL: http://{box}.{port}.preview.localhost:${TWIN_PREVIEW_PORT:-47620}
     # No `extra_hosts` and no volumes, as on `engine`, and here most of all:
     # this is the process that runs turns, so it is the one `execute` would
     # have reached them from (twin-engine SANDBOX-PLAN F2, F4, F5). The relay
@@ -572,7 +575,9 @@ services:
   # The preview gateway: `http://<box>.<port>.preview.localhost:47620` is what
   # box <box> serves on <port>. Published on loopback; `*.localhost` resolves
   # there in every browser, so it needs no DNS. The broker joins it to each
-  # account's network that has a box on it, which is how it reaches the box.
+  # account's network that has a box on it, which is how it reaches the box -
+  # and to an account's network when its twin serves a page of its own, at
+  # `ws-<id>.<port>.preview.localhost` (twin-engine `twin_sandbox/previews.py`).
   preview:
     image: caddy:2.11.4
     restart: unless-stopped
