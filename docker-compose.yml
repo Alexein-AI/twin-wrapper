@@ -411,6 +411,14 @@ services:
       # What a coding box calls by name, joined to its account's network when
       # the code worker opens it (phase 8).
       TWIN_SANDBOX_BOX_SERVICES: llm-proxy,git-proxy,preview
+      # What a coding box is made from. The broker makes every box since
+      # SANDBOX-PLAN phase 8.3 (`twin_sandbox/box_policy.py`); the code worker
+      # asks for one by project and holds no Docker at all. `make
+      # sandbox-image` builds the image; TWIN_BOX_RUNTIME=runsc on a Linux
+      # host with gVisor.
+      TWIN_BOX_IMAGE: ${TWIN_BOX_IMAGE:-twin-box:dev}
+      TWIN_BOX_LLM_URL: http://llm-proxy:8300
+      TWIN_BOX_RUNTIME: ${TWIN_BOX_RUNTIME:-}
       TWIN_SANDBOX_AUDIT_URL: http://engine:8000
       TWIN_SANDBOX_AUDIT_TOKEN: ${TWIN_SANDBOX_AUDIT_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_AUDIT_TOKEN}
       # Off 172.19/16 and off TWIN_SUBNET below; twin-engine/docs/ports.md is
@@ -474,15 +482,17 @@ services:
   # Coding tasks (twin-engine production runtime spec §6.2-6.3). A task runs
   # dsh in a box of its own - a container from `twin-box:dev`, which
   # `make sandbox-image` builds in twin-engine - and these are the box's world:
-  # the worker that drives it, the one path to Docker, and the three services
-  # it calls by name. A box sits on its account's own network, which the
-  # sandbox broker opens and joins those services to, and goes out through the
-  # broker's egress proxy like the account's own container (SANDBOX-PLAN
-  # phase 8). There is no network all boxes share.
+  # the worker that drives it and the three services it calls by name. The
+  # sandbox broker makes the box, on its account's own network, joins those
+  # services to it, and sends it out through the egress proxy like the
+  # account's own container (SANDBOX-PLAN phase 8). There is no network all
+  # boxes share.
   #
   # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
-  # touches a box. The only service that reaches Docker, and only through
-  # `docker-proxy`, on a network nothing else joins.
+  # touches a box. It reaches no Docker: it asks the broker for a box by
+  # project, runs commands in it and streams its agent through the broker's
+  # box routes (phase 8.3), where `docker-proxy` used to hand it the Docker
+  # API with nothing but an endpoint filter in the way.
   code-worker:
     build: ./twin-engine
     restart: unless-stopped
@@ -493,7 +503,6 @@ services:
       DATABASE_URL: postgresql+psycopg://twin:twin@postgres:5432/twin_engine
       TEMPORAL_ADDRESS: temporal:7233
       REDIS_URL: redis://redis:6379
-      DOCKER_HOST: tcp://docker-proxy:2375
       # What the task card links to: the gateway below, on the host port it is
       # published on. The box id in it is the capability.
       TWIN_PREVIEW_URL: http://{box}.{port}.preview.localhost:${TWIN_PREVIEW_PORT:-47620}
@@ -501,45 +510,19 @@ services:
       # GitHub credential to open its draft pull request.
       TWIN_GIT_PROXY_URL: http://git-proxy:8400
       TWIN_BACKEND_URL: http://backend:8080
-      # Where a box's network comes from: its account's, opened by the broker.
+      # Where every box comes from, and every command run in one goes through.
       TWIN_SANDBOX_BROKER_URL: http://sandbox-broker:8766
       TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
-    networks: [default, docker-api]
     # The relay secret - the codec's key, and what box tokens are minted under -
     # is TWIN_RELAY_SECRET from twin-engine/.env, as on `engine-worker`.
     depends_on:
       engine: { condition: service_healthy }
-      docker-proxy: { condition: service_started }
     develop:
       watch:
         - action: sync+restart
           path: ./twin-engine/src
           target: /app/src
           ignore: ['**/__pycache__/']
-
-  # Docker's API, narrowed to what box lifecycle needs: containers, exec,
-  # volumes, and reads of images and networks. No swarm, no secrets, no
-  # plugins, no build. It filters by endpoint and not by payload, so it keeps
-  # a bug in the worker off the rest of the API but does not stop the worker
-  # asking for a privileged container; production runs boxes behind a
-  # provider (spec §6.3), and this is the laptop's stand-in.
-  docker-proxy:
-    image: tecnativa/docker-socket-proxy:0.3.0
-    restart: unless-stopped
-    environment:
-      CONTAINERS: 1
-      EXEC: 1
-      VOLUMES: 1
-      IMAGES: 1
-      NETWORKS: 1
-      INFO: 1
-      POST: 1
-      ALLOW_START: 1
-      ALLOW_STOP: 1
-      ALLOW_RESTARTS: 1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [docker-api]
 
   # Where a box's model calls go: `DEEPSEEK_BASE_URL` in every box. It checks
   # the box's token, charges the project's live task, refuses past the task's
@@ -874,11 +857,3 @@ networks:
     ipam:
       config:
         - subnet: ${TWIN_SUBNET:-10.201.0.0/16}
-  # The code worker and the Docker API proxy, and nothing else. Pinned like
-  # the rest: unpinned, Docker's next free /16 here was 172.19.0.0/16 - this
-  # office's LAN (the note above), measured on 2026-09-24.
-  docker-api:
-    internal: true
-    ipam:
-      config:
-        - subnet: ${TWIN_DOCKER_API_SUBNET:-10.205.0.0/24}
