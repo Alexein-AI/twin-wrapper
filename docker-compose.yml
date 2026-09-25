@@ -402,9 +402,15 @@ services:
       # The string a workspace path is built from, not a mount: the broker names
       # the path inside a tenant container where that account's volume goes.
       TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
-      # The hosts a sandbox may reach. twin-engine/docker-compose.yml has the
-      # reasoning for each; add one by reading what the proxy refused.
-      TWIN_EGRESS_ALLOWLIST: ${TWIN_EGRESS_ALLOWLIST:-api.anthropic.com,platform.claude.com,.pypi.org,.pythonhosted.org,.npmjs.org,.github.com}
+      # The hosts a sandbox may reach - an account's own container and, since
+      # SANDBOX-PLAN phase 8, its coding boxes, which go out through this proxy
+      # too. twin-engine/docker-compose.yml has the reasoning for the first
+      # six; the rest are the package hosts the boxes' Squid allowed. Add one
+      # by reading what the proxy refused.
+      TWIN_EGRESS_ALLOWLIST: ${TWIN_EGRESS_ALLOWLIST:-api.anthropic.com,platform.claude.com,.pypi.org,.pythonhosted.org,pypi.python.org,.npmjs.org,.npmjs.com,.yarnpkg.com,.github.com,.githubusercontent.com,nodejs.org,.astral.sh,.crates.io,proxy.golang.org,sum.golang.org,deb.debian.org}
+      # What a coding box calls by name, joined to its account's network when
+      # the code worker opens it (phase 8).
+      TWIN_SANDBOX_BOX_SERVICES: llm-proxy,git-proxy,preview
       TWIN_SANDBOX_AUDIT_URL: http://engine:8000
       TWIN_SANDBOX_AUDIT_TOKEN: ${TWIN_SANDBOX_AUDIT_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_AUDIT_TOKEN}
       # Off 172.19/16 and off TWIN_SUBNET below; twin-engine/docs/ports.md is
@@ -467,10 +473,12 @@ services:
 
   # Coding tasks (twin-engine production runtime spec §6.2-6.3). A task runs
   # dsh in a box of its own - a container from `twin-box:dev`, which
-  # `make sandbox-image` builds in twin-engine - and these five are the box's
-  # world: the worker that drives it, the one path to Docker, the three
-  # things a box can reach on `twin-sandbox`, which has no route out, and the git
-  # proxy a repository is reached through.
+  # `make sandbox-image` builds in twin-engine - and these are the box's world:
+  # the worker that drives it, the one path to Docker, and the three services
+  # it calls by name. A box sits on its account's own network, which the
+  # sandbox broker opens and joins those services to, and goes out through the
+  # broker's egress proxy like the account's own container (SANDBOX-PLAN
+  # phase 8). There is no network all boxes share.
   #
   # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
   # touches a box. The only service that reaches Docker, and only through
@@ -493,6 +501,9 @@ services:
       # GitHub credential to open its draft pull request.
       TWIN_GIT_PROXY_URL: http://git-proxy:8400
       TWIN_BACKEND_URL: http://backend:8080
+      # Where a box's network comes from: its account's, opened by the broker.
+      TWIN_SANDBOX_BROKER_URL: http://sandbox-broker:8766
+      TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
     networks: [default, docker-api]
     # The relay secret - the codec's key, and what box tokens are minted under -
     # is TWIN_RELAY_SECRET from twin-engine/.env, as on `engine-worker`.
@@ -548,7 +559,8 @@ services:
       OPENROUTER_KEY: ${OPENROUTER_KEY:?run ./setup.sh - it copies OPENROUTER_KEY here from twin-engine/.env}
       TWIN_BOX_PROXY_TOKEN: ${TWIN_BOX_PROXY_TOKEN:?run ./setup.sh - it mints TWIN_BOX_PROXY_TOKEN}
       TWIN_ENGINE_URL: http://engine:8000
-    networks: [default, twin-sandbox]
+    # On the project network only: the broker joins it to each account's
+    # network that has a box on it, under this service's name.
     depends_on:
       engine: { condition: service_healthy }
 
@@ -564,22 +576,15 @@ services:
     environment:
       TWIN_BOX_PROXY_TOKEN: ${TWIN_BOX_PROXY_TOKEN:?run ./setup.sh - it mints TWIN_BOX_PROXY_TOKEN}
       TWIN_ENGINE_URL: http://engine:8000
-    networks: [default, twin-sandbox]
+    # On the project network only: the broker joins it to each account's
+    # network that has a box on it, under this service's name.
     depends_on:
       engine: { condition: service_healthy }
 
-  # A box's only route to the internet: package registries and GitHub reads
-  # (`twin-engine/sandbox/egress/squid.conf` says which, and why).
-  egress:
-    image: ubuntu/squid:6.13-25.04_beta
-    restart: unless-stopped
-    volumes:
-      - ./twin-engine/sandbox/egress/squid.conf:/etc/squid/squid.conf:ro
-    networks: [default, twin-sandbox]
-
   # The preview gateway: `http://<box>.<port>.preview.localhost:47620` is what
   # box <box> serves on <port>. Published on loopback; `*.localhost` resolves
-  # there in every browser, so it needs no DNS.
+  # there in every browser, so it needs no DNS. The broker joins it to each
+  # account's network that has a box on it, which is how it reaches the box.
   preview:
     image: caddy:2.11.4
     restart: unless-stopped
@@ -587,7 +592,6 @@ services:
       - ./twin-engine/sandbox/preview/Caddyfile:/etc/caddy/Caddyfile:ro
     ports:
       - '127.0.0.1:${TWIN_PREVIEW_PORT:-47620}:80'
-    networks: [default, twin-sandbox]
 
   frontend:
     build:
@@ -870,15 +874,6 @@ networks:
     ipam:
       config:
         - subnet: ${TWIN_SUBNET:-10.201.0.0/16}
-  # Where boxes live. Internal: no gateway, so a box reaches `egress`,
-  # `llm-proxy` and `preview` by name and nothing else at all. Named, because
-  # the code worker creates boxes on it by that name.
-  twin-sandbox:
-    name: twin-sandbox
-    internal: true
-    ipam:
-      config:
-        - subnet: ${TWIN_SANDBOX_SUBNET:-10.202.0.0/16}
   # The code worker and the Docker API proxy, and nothing else. Pinned like
   # the rest: unpinned, Docker's next free /16 here was 172.19.0.0/16 - this
   # office's LAN (the note above), measured on 2026-09-24.
