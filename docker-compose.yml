@@ -415,11 +415,11 @@ services:
       # The string a workspace path is built from, not a mount: the broker names
       # the path inside a tenant container where that account's volume goes.
       TWIN_ROOT: ${TWIN_ROOT:?set TWIN_ROOT in the root .env - run ./setup.sh}
-      # The hosts a sandbox may reach - an account's own container and, since
-      # SANDBOX-PLAN phase 8, its coding boxes, which go out through this proxy
-      # too. twin-engine/docker-compose.yml has the reasoning for the first
-      # six; the rest are the package hosts the boxes' Squid allowed. Add one
-      # by reading what the proxy refused.
+      # The hosts an account's own container may reach, beside those its person
+      # granted it. Coding boxes go out through this proxy too, and since
+      # 2026-09-28 reach any public host on 443 whatever this says.
+      # twin-engine/docker-compose.yml has the reasoning for the first six; the
+      # rest are the package hosts the boxes' Squid allowed.
       TWIN_EGRESS_ALLOWLIST: ${TWIN_EGRESS_ALLOWLIST:-api.anthropic.com,platform.claude.com,.pypi.org,.pythonhosted.org,pypi.python.org,.npmjs.org,.npmjs.com,.yarnpkg.com,.github.com,.githubusercontent.com,nodejs.org,.astral.sh,.crates.io,proxy.golang.org,sum.golang.org,deb.debian.org}
       # What a coding box calls by name, joined to its account's network when
       # the code worker opens it (phase 8).
@@ -441,6 +441,10 @@ services:
     volumes:
       # Here and nowhere else. `engine` must never grow this line.
       - /var/run/docker.sock:/var/run/docker.sock
+      # The hosts each person let their twin's own shell reach beyond the
+      # allowlist (`allow_host`), written here and mounted read-only into the
+      # egress proxy the broker makes (twin-engine `twin_sandbox/grants.py`).
+      - twin-egress-rules:/var/lib/twin-egress
 
   # The worker: `python -m twin_workflows`, which executes every turn. Scale it
   # with `docker compose up --scale engine-worker=N`; Temporal hands each chat
@@ -870,6 +874,10 @@ volumes:
   # Losing it loses what in-flight chats were waiting on, never their messages,
   # which are in the engine's database.
   twin-temporal-data:
+  # What each person let their twin's shell reach. Named outright, because the
+  # broker mounts it by that name into the egress proxy it makes itself.
+  twin-egress-rules:
+    name: twin-egress-rules
 
 # Pinned off 172.19/16, which is this office's LAN (172.19.2.0/23). Compose's
 # default pick swallowed it once: every container routed 172.19.2.202 onto its
