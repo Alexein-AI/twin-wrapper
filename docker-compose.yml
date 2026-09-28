@@ -16,6 +16,14 @@
 # checkout would silently strand every one of them.
 name: twin
 
+# Langfuse, the twin's traces, comes up with the rest (2026-09-28): its own
+# Postgres, Redis, ClickHouse and MinIO on a network of its own, which it
+# shares with nothing here (twin-engine `infra/langfuse/docker-compose.yml`
+# says how the two files fit). Its secrets are interpolated from that
+# directory's `.env`, not this one's.
+include:
+  - path: ./twin-engine/infra/langfuse/docker-compose.yml
+
 # --------------------------------------------------------------------------
 # Config
 #
@@ -304,9 +312,10 @@ services:
       # correct and has always been confusing: what this dials is the backend's
       # connector-facing API on 8080, not twin-connectors on 8090.
       CONNECTORS_URL: http://backend:8080
-      # Langfuse is not in this file - it is its own stack under infra/langfuse
-      # - so it is still reached across the host. Docker Desktop resolves the
-      # name by itself; a Linux engine does not, so set LANGFUSE_HOST there.
+      # Langfuse is included above but on a network of its own, never this
+      # one, so it is reached across the host at its published port. Docker
+      # Desktop resolves the name by itself; a Linux engine does not, so set
+      # LANGFUSE_HOST there.
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://host.docker.internal:3000}
       # One root for every tenant: `<TWIN_ROOT>/<company>/<account>`. A string
       # and not a mount (twin-backend ADR 41): each workspace is a volume in
