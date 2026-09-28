@@ -395,6 +395,12 @@ services:
     # Root, and honestly: anything that can reach the socket is root on the
     # host already, and the image's own user cannot open it.
     user: '0:0'
+    # A ceiling of its own, so that if this process ever grows without bound
+    # the kernel ends it - it restarts and adopts its containers - and not
+    # Postgres, which shares the Docker VM. What it holds per command is
+    # bounded (twin-engine `twin_sandbox/output.py` keeps 4 MiB of any
+    # output), so this is room, not a budget.
+    mem_limit: 2g
     environment:
       TWIN_SANDBOX_HOST: 0.0.0.0
       TWIN_SANDBOX_BROKER_TOKEN: ${TWIN_SANDBOX_BROKER_TOKEN:?run ./setup.sh - it mints TWIN_SANDBOX_BROKER_TOKEN}
