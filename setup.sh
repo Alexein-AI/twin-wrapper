@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # setup.sh - everything `docker compose up` cannot do for itself. Run once.
 #
-#   ./setup.sh              preflight, .env files, secrets, sandbox images
+#   ./setup.sh              preflight, .env files, secrets, sandbox images, the host agent
 #   ./setup.sh --check      report only; nothing is written or installed
+#   ./setup.sh --no-agent   skip the Claude Code agent entirely
 #   ./setup.sh --help
 #
 # Then, and every time after that:
@@ -25,9 +26,12 @@
 #   3. The sandbox images - a tenant's container, its egress proxy, and a
 #      coding task's box - are built here, because the broker and the code
 #      worker start them and no compose service does.
-#      Claude Code runs in those containers (twin-engine SANDBOX-PLAN 7); a
-#      machine that ran the old host agent has it retired below.
-#   4. The root .env carries what compose interpolates before a container exists
+#   4. The Claude Code agent is a host process: a separate ingestion service
+#      on this machine, which reads ~/.claude here and pushes what its sessions
+#      did to the backend. No container can hold it, and `docker compose build`
+#      has nothing to say about it (2026-09-28; it was the container's own
+#      wire from SANDBOX-PLAN 7 until then).
+#   5. The root .env carries what compose interpolates before a container exists
 #      - a volume path, a build argument - and those live in two other files.
 #
 # Written for stock macOS: bash 3.2 (no mapfile, no associative arrays), BSD
@@ -37,7 +41,7 @@ set -uo pipefail
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
@@ -46,9 +50,11 @@ cd "$(dirname "$0")" || exit 1
 ROOT="$(pwd)"
 
 CHECK_ONLY=0
+WITH_AGENT=1
 for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
+    --no-agent) WITH_AGENT=0 ;;
     *)
       echo "setup: unknown option $arg (try --help)" >&2
       exit 1
@@ -230,6 +236,25 @@ else
   warn "pnpm absent - corepack enable, or brew install pnpm"
 fi
 
+# The agent's half. Soft, because --no-agent is a supported way to run and the
+# containers all come up without any of it.
+if [ "$WITH_AGENT" -eq 1 ]; then
+  # Hardcoded in claude-agent/src/drive/tmux.ts with no environment override, so
+  # this is a path check and not a `command -v` one.
+  if [ -x /opt/homebrew/bin/tmux ]; then
+    ok "tmux at /opt/homebrew/bin/tmux"
+  else
+    warn "tmux is not at /opt/homebrew/bin/tmux - the path is hardcoded with no override"
+    add_todo "brew install tmux (the agent looks only at /opt/homebrew/bin/tmux)"
+  fi
+  if [ -x /opt/homebrew/bin/claude ] || command -v claude >/dev/null 2>&1; then
+    ok "claude CLI"
+    [ -d "$HOME/.claude" ] || warn "~/.claude is empty - log the claude CLI in first"
+  else
+    warn "claude CLI absent - npm i -g @anthropic-ai/claude-code, then log in"
+    add_todo "install and log in the claude CLI"
+  fi
+fi
 finish_if_fatal
 
 # ------------------------------------------------------------- env files ---
@@ -551,83 +576,28 @@ check_host_url "$BACKEND/.env" DATABASE_URL "postgres://twin:twin@localhost:5500
 check_host_url "$BACKEND/.env" REDIS_URL "redis://localhost:6500" "twin-backend/.env"
 check_host_url "$ENGINE/.env" DATABASE_URL "postgresql+psycopg://twin:twin@localhost:5500/twin_engine" "twin-engine/.env"
 
-# --------------------------------------------------------- retired agent ---
-# The Claude Code agent was a host process until twin-engine SANDBOX-PLAN 7.6
-# (twin-backend ADR 41). Once `claude-agent/` is deleted, a machine that
-# installed it keeps two things pointing at files that are gone: a service that restarts on failure, and a hook in the
-# Claude Code settings that every tool call in every session runs - a
-# `Cannot find module` each time. Both are removed; nothing else is touched.
-say "the retired host agent"
-retire_service() {
-  plist="$HOME/Library/LaunchAgents/ai.alexein.twin-agent.plist"
-  unit="$HOME/.config/systemd/user/twin-agent.service"
-  if [ ! -f "$plist" ] && [ ! -f "$unit" ]; then
-    ok "no agent service left behind"
-    return 0
-  fi
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    warn "the old agent's service is still installed - would remove it"
-    return 0
-  fi
-  if [ -f "$plist" ]; then
-    launchctl bootout "gui/$(id -u)/ai.alexein.twin-agent" 2>/dev/null || true
-    rm -f "$plist" && ok "removed the old agent's launch agent"
-  fi
-  if [ -f "$unit" ]; then
-    systemctl --user disable --now twin-agent.service 2>/dev/null || true
-    rm -f "$unit" && systemctl --user daemon-reload 2>/dev/null
-    ok "removed the old agent's systemd unit"
-  fi
-}
-# Matched on the script's name, as the agent's own uninstaller did, and the
-# file rewritten through a temporary so a failure leaves it as it was.
-retire_hook() {
-  settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-  if ! grep -q '/hooks/pending\.mjs' "$settings" 2>/dev/null; then
-    ok "no agent hook in $settings"
-    return 0
-  fi
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    warn "$settings still runs the old agent's hook - would remove it"
-    return 0
-  fi
-  if ! command -v node >/dev/null 2>&1; then
-    warn "$settings still runs the old agent's hook, and removing it needs node"
-    add_todo "delete every hook ending in /hooks/pending.mjs from $settings"
-    STATUS=1
-    return 0
-  fi
-  SETTINGS="$settings" node -e '
-    const fs = require("fs");
-    const path = process.env.SETTINGS;
-    const held = JSON.parse(fs.readFileSync(path, "utf8"));
-    const hooks = { ...(held.hooks ?? {}) };
-    for (const [event, groups] of Object.entries(hooks)) {
-      const kept = groups
-        .map((group) => ({ ...group, hooks: (group.hooks ?? []).filter(
-          (one) => !String(one.command).endsWith("/hooks/pending.mjs")) }))
-        .filter((group) => group.hooks.length > 0);
-      if (kept.length > 0) hooks[event] = kept; else delete hooks[event];
-    }
-    fs.writeFileSync(`${path}.tmp`, `${JSON.stringify({ ...held, hooks }, null, 2)}\n`);
-    fs.renameSync(`${path}.tmp`, path);
-  ' && ok "removed the old agent's hook from $settings" \
-    || { warn "could not rewrite $settings - it is left as it was"; STATUS=1; }
-}
-# Only once the directory is gone. While it is in twin-engine - on `dev`,
-# and on this branch until the owner decides how a container session is
-# watched - `dev` still runs the agent, and switching back must find it.
-if [ -d "$ENGINE/claude-agent" ]; then
-  ok "twin-engine/claude-agent/ is still here - its agent stays installed for dev"
-else
-  retire_service
-  retire_hook
-fi
-
 if [ "$CHECK_ONLY" -eq 1 ]; then
   say "check only - nothing was written or installed"
   print_todo
   exit "$STATUS"
+fi
+
+# ----------------------------------------------------------------- agent ---
+if [ "$WITH_AGENT" -eq 1 ]; then
+  say "claude-code agent (a host process - no container has anything to do with it)"
+  (cd "$ENGINE/claude-agent" && pnpm install --prefer-offline --silent 2>&1 | sed 's/^/    /')
+  # install.sh, not `make agent-up`: the launch agent is what survives a reboot,
+  # and `--restart` on a machine that never installed it prints a line and exits
+  # 0 - exactly the silent no-op this script exists to prevent.
+  (cd "$ENGINE/claude-agent" && ./service/install.sh 2>&1 | sed 's/^/    /')
+  if curl -sf -m 5 http://127.0.0.1:47600/health >/dev/null 2>&1; then
+    ok "agent answers on 127.0.0.1:47600"
+  else
+    warn "the agent is not listening - claude-code sessions will never arrive, and the"
+    warn "  backend spends 30s x 3 attempts a cycle discovering that"
+    add_todo "check twin-engine/claude-agent/.run/agent.log"
+    STATUS=1
+  fi
 fi
 
 # ------------------------------------------------------------------ done ---
@@ -648,9 +618,10 @@ printf '%sthe two steps a script cannot do for you:%s\n' "$BLU" "$OFF"
 cat <<'EOF'
   1. Sign in at http://localhost:4000. Identity is Clerk's (ADR 37), so this is
      a browser sign-in and there is no terminal equivalent.
-  2. Connect Claude Code from http://localhost:4000/connections: sign the
-     container in to your own Anthropic account, then Connect. It runs in a
-     container of yours (twin-backend ADR 41); nothing is installed here.
+  2. Pair Claude Code. On http://localhost:4000/connections press Connect on
+     Claude Code and give it the agent's pairing password - `make
+     agent-password` in twin-engine says whether one is set, and
+     `TWIN_AGENT_PAIR_PASSWORD=... make agent-setup` there sets it.
 EOF
 echo
 info "logs:     docker compose logs -f <service>"

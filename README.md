@@ -23,11 +23,10 @@ Then open <http://localhost:4000>.
 | `redis` | `localhost:6500` | queues, rate limits, and the event list |
 
 Plus what the broker starts on demand: one container per account, holding its
-workspace and its Claude Code sessions, and one egress proxy. Nothing runs on
-this machine outside Docker on this branch - the Claude Code agent that did is
-retired (twin-backend ADR 41). It stays installed while `twin-engine/claude-agent/`
-exists, because `main` and the other repos' `dev` still use it, and `setup.sh`
-removes it only once that directory is gone.
+workspace, and one egress proxy. One thing runs outside Docker, as on `main`:
+the Claude Code agent (`twin-engine/claude-agent/`), a separate ingestion
+service on this machine that reads `~/.claude` here and pushes what its
+sessions did to the backend. `setup.sh` installs it; `--no-agent` skips it.
 
 ## How an event becomes a memory
 
@@ -119,9 +118,10 @@ docker compose --profile tunnel-named up -d   # a public url for inbound webhook
 1. **Sign in** at <http://localhost:4000>. Identity is Clerk's (ADR 37), so this
    is a browser sign-in with no terminal equivalent: the connect route and
    minting a `twk_` key are both behind `requireViewer`.
-2. **Connect Claude Code** from <http://localhost:4000/connections>: sign the
-   container in to your own Anthropic account, then Connect. It pairs with a
-   one-time password the engine issues once the login lands; nothing is pasted.
+2. **Pair Claude Code.** On <http://localhost:4000/connections> press Connect on
+   Claude Code and give it the agent's pairing password - `make agent-password`
+   in twin-engine says whether one is set, and
+   `TWIN_AGENT_PAIR_PASSWORD=... make agent-setup` there sets it.
 
 ## Ports
 

@@ -157,10 +157,6 @@ services:
       # Overridable because a provider that refuses a plaintext redirect uri
       # needs this to be an https tunnel for the duration of one connect.
       BASE_URL: ${BASE_URL:-http://localhost:8080}
-      # Where a push is addressed. Only claude-code hands out a callback, and
-      # its pushes come from `engine` on this network, where `localhost` is the
-      # engine itself - so the service name, not BASE_URL.
-      WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-http://backend:8080}
       # The one origin CORS allows and the origin on the event stream. The
       # frontend is in this file now, so this defaults to it rather than to the
       # backend's own /connected page. localhost and 127.0.0.1 are different
@@ -225,10 +221,10 @@ services:
       REDIS_URL: redis://redis:6379
       PROVIDER_CONFIG_DIR: /app/config/providers
       CONNECTORS_PORT: 8090
-      # The claude-code agent is the engine (twin-engine SANDBOX-PLAN phase 7),
-      # reached where it publishes on the host: twin-connectors admits plain
-      # http only to a loopback name, and `engine` is not one.
-      CLAUDE_CODE_BASE_URL: ${CLAUDE_CODE_BASE_URL:-http://host.docker.internal:${TWIN_API_PORT:-8000}/claude-code}
+      # The Claude Code agent is a host process - it drives tmux and reads
+      # ~/.claude on this machine, so no container can hold it. This is Docker's
+      # alias for the host, so the request still never leaves it.
+      CLAUDE_CODE_BASE_URL: ${CLAUDE_CODE_BASE_URL:-http://host.docker.internal:47600}
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     volumes:
