@@ -463,7 +463,9 @@ services:
   box-files:
     build: ./twin-engine
     restart: unless-stopped
-    command: ['uv', 'run', 'python', '-m', 'twin_code.files']
+    # Not the image's entrypoint, which provisions the database first: this
+    # service has none, and holding no database credential is the point.
+    entrypoint: ['uv', 'run', 'python', '-m', 'twin_code.files']
     env_file: [./twin-engine/.env]
     environment:
       DOCKER_HOST: tcp://docker-proxy:2375
