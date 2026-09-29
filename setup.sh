@@ -474,6 +474,28 @@ if [ -n "$memory_secret" ]; then
       || fatal "could not write twin-engine/.env"
   fi
 fi
+
+# 7. OPENROUTER_API_KEY, twin-memory's name for the model key. The consumer
+#    cards every MEMORY_CARD_EVERY batches (10 unless the root .env says 0) and
+#    exits at start without it. Filled from the engine's when empty, and left
+#    alone once set: a key of its own for memory's spend is a person's call.
+card_every="$(env_get "$ROOT/.env" MEMORY_CARD_EVERY 2>/dev/null)"
+engine_key="$(env_get "$ENGINE/.env" OPENROUTER_KEY 2>/dev/null)"
+memory_key="$(env_get "$MEMORY/.env" OPENROUTER_API_KEY 2>/dev/null)"
+if [ "${card_every:-10}" = 0 ]; then
+  info "MEMORY_CARD_EVERY=0 - twin-memory makes no model calls and needs no key"
+elif [ "$memory_key" = "$engine_key" ]; then
+  ok "OPENROUTER_API_KEY in twin-memory matches the engine's OPENROUTER_KEY"
+elif [ -n "$memory_key" ]; then
+  warn "OPENROUTER_API_KEY in twin-memory is not the engine's OPENROUTER_KEY - fine if deliberate"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "OPENROUTER_API_KEY is empty in twin-memory - would copy the engine's OPENROUTER_KEY"
+  STATUS=1
+else
+  env_set "$MEMORY/.env" OPENROUTER_API_KEY "$engine_key" \
+    && ok "copied the engine's OPENROUTER_KEY into twin-memory/.env as OPENROUTER_API_KEY" \
+    || fatal "could not write twin-memory/.env"
+fi
 finish_if_fatal
 
 # -------------------------------------------------------------- root env ---
@@ -607,11 +629,15 @@ cat <<'EOF'
 
     frontend    http://localhost:4000      open this one
     backend     http://localhost:8080
-    engine      http://127.0.0.1:8000      unauthenticated dev harness, loopback only
+    engine      http://127.0.0.1:8000      every route needs the relay secret, loopback only
     memory      http://127.0.0.1:8200      retrieval only, loopback only
-    connectors  connectors:8090            no host port, by design
-    postgres    localhost:5500             twin_backend / twin_engine / twin_memory
-    redis       localhost:6500
+    temporal    http://127.0.0.1:8233      the workflow UI
+    langfuse    http://127.0.0.1:3000      the twin's traces
+    preview     http://127.0.0.1:47620     what a coding box serves, at <box>.<port>.preview.localhost
+    postgres    127.0.0.1:5500             twin_backend / twin_engine / twin_memory
+    redis       127.0.0.1:6500
+
+    README.md's "What runs" has every service, the ones with no host port too.
 EOF
 echo
 printf '%sthe two steps a script cannot do for you:%s\n' "$BLU" "$OFF"
