@@ -575,6 +575,10 @@ services:
     env_file: [./twin-frontend/.env.local]
     environment:
       NODE_ENV: development
+      # The sync writes the host's node_modules/.modules.yaml in, which points
+      # pnpm at a macOS store; without a TTY its repair aborts and the container
+      # restart-loops. `CI` makes that repair non-interactive - it takes 3s.
+      CI: 'true'
       TWIN_ENV: ${TWIN_ENV:-dev}
       # Fixed, like the backend's: a container has its own namespace, so only
       # the host side varies and `frontend:4000` then means one thing.
@@ -592,6 +596,13 @@ services:
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
     ports:
       - '${FRONTEND_PORT:-4000}:4000'
+    # The watch `ignore` list below does not hold: the host's
+    # node_modules/.modules.yaml reached the container and pointed pnpm at a
+    # macOS store path, which it then tried to purge without a TTY - a restart
+    # loop. Anonymous volumes keep both directories the container's own.
+    volumes:
+      - /app/node_modules
+      - /app/.next
     # A bare `/` answers a redirect to /sign-in with no session, which is the
     # correct response and a fine liveness signal. The first request compiles
     # the route, so the dev server gets longer to answer than a built one did.
