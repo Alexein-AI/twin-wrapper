@@ -40,7 +40,7 @@ Set them all, then run it again:
 | --- | --- |
 | `twin-backend/.env` | `CLERK_SECRET_KEY`, `CLERK_JWT_KEY`, `TWIN_ROOT` |
 | `twin-frontend/.env.local` | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `TWIN_PUBLIC_URL` |
-| `twin-engine/.env` | `OPENROUTER_KEY`, `TWIN_ROOT`, `TWIN_SANDBOX_ACCOUNTS=*` |
+| `twin-engine/.env` | `OPENROUTER_KEY`, `TWIN_ROOT` |
 
 - The Clerk keys are one Clerk application's, so `CLERK_SECRET_KEY` is the
   same string in both files.
@@ -49,7 +49,8 @@ Set them all, then run it again:
   or Connect is refused. `http://localhost:4000` for both.
 
 The second run makes everything else: the per-machine secrets, the copies of
-the model key, the root `.env`, the three sandbox images, and the agent's
+the model key, `TWIN_SANDBOX_ACCOUNTS=*`, the root `.env`, the three sandbox
+images (rebuilt on every run, so a pull reaches them), and the agent's
 launch agent. It is safe to re-run,
 and `./setup.sh --check` reports without writing anything.
 

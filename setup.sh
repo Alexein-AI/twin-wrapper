@@ -382,14 +382,17 @@ else
     STATUS=1
   fi
 fi
-# Every account is sandboxed, and an account the list does not name has no
-# workspace and no shell at all. A person's choice, so reported, never set.
+# Every account is sandboxed, on every machine: an account the list does not
+# name has no workspace and no shell at all. So `*` is set, not left to a person.
 if [ "$(env_get "$ENGINE/.env" TWIN_SANDBOX_ACCOUNTS 2>/dev/null)" = '*' ]; then
   ok "TWIN_SANDBOX_ACCOUNTS=* - every account has a sandbox"
-else
-  warn "TWIN_SANDBOX_ACCOUNTS in twin-engine/.env is not * - accounts it does not name get no files and no shell"
-  add_todo "set TWIN_SANDBOX_ACCOUNTS=* in twin-engine/.env"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "TWIN_SANDBOX_ACCOUNTS in twin-engine/.env is not * - would set it"
   STATUS=1
+else
+  env_set "$ENGINE/.env" TWIN_SANDBOX_ACCOUNTS '*' \
+    && ok "set TWIN_SANDBOX_ACCOUNTS=* in twin-engine/.env - every account has a sandbox" \
+    || fatal "could not write twin-engine/.env"
 fi
 finish_if_fatal
 
@@ -594,15 +597,13 @@ fi
 # What tenant containers, their egress proxy and coding tasks' boxes are made
 # from. The broker refuses to start without the first two, a task fails on its
 # first box without the third, and compose builds no image no service runs.
-# Built only when missing: after a change to infra/sandbox, twin_egress or
-# sandbox/, run `make sandbox-image egress-image` in twin-engine.
+# Built on every run, not only when missing: a machine that pulled new
+# sandbox/ source kept its old box, and an unchanged build is cached (~2s each).
 say "sandbox images"
 for pair in "twin-sandbox:dev workspace-image" "twin-egress:dev egress-image" "twin-box:dev box-image"; do
   image=${pair% *} target=${pair#* }
-  if docker image inspect "$image" >/dev/null 2>&1; then
-    ok "$image present"
-  elif [ "$CHECK_ONLY" -eq 1 ]; then
-    warn "no $image - would build it (make $target in twin-engine)"
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    info "would build $image (make $target in twin-engine)"
   elif (cd "$ENGINE" && make "$target" >/dev/null 2>&1); then
     ok "built $image"
   else
