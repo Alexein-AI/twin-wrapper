@@ -1,3 +1,5 @@
 twin-*
 .env
 .twin-up-backups/
+.DS_Store
+staging/

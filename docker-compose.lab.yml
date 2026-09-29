@@ -1,0 +1,39 @@
+# Serve the connectors branch out of its worktree, without moving a port.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lab.yml up -d connectors
+#
+# Deliberately *not* named docker-compose.override.yml: that name is loaded
+# automatically, so it would quietly follow every later `docker compose up` in
+# this tree and there would be no moment where anyone chose it.
+#
+# Only the three bind mounts move. The image, the network, the port (none - the
+# service is reached at connectors:8090 on the compose network) and every other
+# service are the root file's, unchanged: this stack still runs one connectors
+# container, it is just reading a different checkout of the same repo.
+#
+# `config` is what matters today - the root file notes these are mounted rather
+# than baked so an edit needs a restart and not a rebuild, and that holds across
+# worktrees too. `src` and `packages` come along so the new sources can be
+# developed the same way.
+services:
+  connectors:
+    volumes:
+      - ./lab/twin-connectors/src:/app/src
+      - ./lab/twin-connectors/packages:/app/packages
+      - ./lab/twin-connectors/config:/app/config
+      - /app/node_modules
+      - /app/packages/config/node_modules
+      - /app/packages/core/node_modules
+      - /app/packages/ingest/node_modules
+      - /app/packages/providers/node_modules
+      - /app/packages/queue/node_modules
+      - /app/packages/sdk/node_modules
+      - /app/packages/telemetry/node_modules
+    develop:
+      watch:
+        - action: restart
+          path: ./lab/twin-connectors/src
+        - action: restart
+          path: ./lab/twin-connectors/packages
+        - action: restart
+          path: ./lab/twin-connectors/config/providers

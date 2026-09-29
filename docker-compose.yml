@@ -596,11 +596,18 @@ services:
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
     ports:
       - '${FRONTEND_PORT:-4000}:4000'
-    # The watch `ignore` list below does not hold: the host's
-    # node_modules/.modules.yaml reached the container and pointed pnpm at a
-    # macOS store path, which it then tried to purge without a TTY - a restart
-    # loop. Anonymous volumes keep both directories the container's own.
+    # Bind-mounted, not synced. A sync updated the client module graph and left
+    # the server one stale, so a page server-rendered the old component and
+    # hydrated the new one; React threw, and `next dev` answered every route
+    # with its "missing required error components" stub - a 404 carrying a 1s
+    # retry that never recovers. An in-place write invalidates both graphs.
+    #
+    # The two anonymous volumes still matter: the host's
+    # node_modules/.modules.yaml points pnpm at a macOS store, and without a TTY
+    # its repair aborts and the container restart-loops. They stay the
+    # container's own.
     volumes:
+      - ./twin-frontend:/app
       - /app/node_modules
       - /app/.next
     # A bare `/` answers a redirect to /sign-in with no session, which is the
@@ -618,26 +625,12 @@ services:
       start_period: 60s
     depends_on:
       backend: { condition: service_started }
-    # Synced, not bind-mounted: this bind mount would be virtiofs, which never
-    # emits the inotify events `next dev` needs. A synced write lands on the
-    # container's own filesystem, so it does fire them, and HMR picks it up in
-    # a second. Without `--watch` the container serves the source it was built
-    # with. A dependency change needs the install redone, so it rebuilds.
+    # Source arrives by the bind mount above, so nothing syncs here and HMR
+    # needs no `docker compose watch` running. Only a dependency change still
+    # does, because the install lives in the image: run `docker compose watch
+    # frontend` when you touch these, or rebuild the service by hand.
     develop:
       watch:
-        - action: sync
-          path: ./twin-frontend
-          target: /app
-          ignore:
-            - node_modules/
-            - .next/
-            - .git/
-            - test-results/
-            - playwright-report/
-            - coverage/
-            - package.json
-            - pnpm-lock.yaml
-            - pnpm-workspace.yaml
         - action: rebuild
           path: ./twin-frontend/package.json
         - action: rebuild
