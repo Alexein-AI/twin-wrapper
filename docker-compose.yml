@@ -423,8 +423,8 @@ services:
   # proxy a repository is reached through.
   #
   # `python -m twin_code`: runs `CodeTaskWorkflow` and every activity that
-  # touches a box. The only service that reaches Docker, and only through
-  # `docker-proxy`, on a network nothing else joins.
+  # touches a box. One of the two services that reach Docker (box-files is the
+  # other), and only through `docker-proxy`, on a network nothing else joins.
   code-worker:
     build: ./twin-engine
     restart: unless-stopped
@@ -449,6 +449,28 @@ services:
       - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
     depends_on:
       engine: { condition: service_healthy }
+      docker-proxy: { condition: service_started }
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./twin-engine/src
+          target: /app/src
+          ignore: ['**/__pycache__/']
+
+  # One file of a box's workspace for the task panel's Files tab, read through
+  # Docker's archive API so a sleeping box is read without being started. It
+  # answers the engine alone, which checks the path first (engine spec §6.12).
+  box-files:
+    build: ./twin-engine
+    restart: unless-stopped
+    command: ['uv', 'run', 'python', '-m', 'twin_code.files']
+    env_file: [./twin-engine/.env]
+    environment:
+      DOCKER_HOST: tcp://docker-proxy:2375
+    networks: [default, docker-api]
+    volumes:
+      - ${TWIN_RELAY_DIR:-${HOME}/.twin-relay}:/root/.twin-relay:ro
+    depends_on:
       docker-proxy: { condition: service_started }
     develop:
       watch:
