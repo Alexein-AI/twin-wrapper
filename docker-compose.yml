@@ -614,6 +614,10 @@ services:
     env_file: [./twin-frontend/.env.local]
     environment:
       NODE_ENV: development
+      # The sync writes the host's node_modules/.modules.yaml in, which points
+      # pnpm at a macOS store; without a TTY its repair aborts and the container
+      # restart-loops. `CI` makes that repair non-interactive - it takes 3s.
+      CI: 'true'
       TWIN_ENV: ${TWIN_ENV:-dev}
       # Fixed, like the backend's: a container has its own namespace, so only
       # the host side varies and `frontend:4000` then means one thing.
@@ -631,6 +635,20 @@ services:
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
     ports:
       - '${FRONTEND_PORT:-4000}:4000'
+    # Bind-mounted, not synced. A sync updated the client module graph and left
+    # the server one stale, so a page server-rendered the old component and
+    # hydrated the new one; React threw, and `next dev` answered every route
+    # with its "missing required error components" stub - a 404 carrying a 1s
+    # retry that never recovers. An in-place write invalidates both graphs.
+    #
+    # The two anonymous volumes still matter: the host's
+    # node_modules/.modules.yaml points pnpm at a macOS store, and without a TTY
+    # its repair aborts and the container restart-loops. They stay the
+    # container's own.
+    volumes:
+      - ./twin-frontend:/app
+      - /app/node_modules
+      - /app/.next
     # A bare `/` answers a redirect to /sign-in with no session, which is the
     # correct response and a fine liveness signal. The first request compiles
     # the route, so the dev server gets longer to answer than a built one did.
@@ -646,26 +664,12 @@ services:
       start_period: 60s
     depends_on:
       backend: { condition: service_started }
-    # Synced, not bind-mounted: this bind mount would be virtiofs, which never
-    # emits the inotify events `next dev` needs. A synced write lands on the
-    # container's own filesystem, so it does fire them, and HMR picks it up in
-    # a second. Without `--watch` the container serves the source it was built
-    # with. A dependency change needs the install redone, so it rebuilds.
+    # Source arrives by the bind mount above, so nothing syncs here and HMR
+    # needs no `docker compose watch` running. Only a dependency change still
+    # does, because the install lives in the image: run `docker compose watch
+    # frontend` when you touch these, or rebuild the service by hand.
     develop:
       watch:
-        - action: sync
-          path: ./twin-frontend
-          target: /app
-          ignore:
-            - node_modules/
-            - .next/
-            - .git/
-            - test-results/
-            - playwright-report/
-            - coverage/
-            - package.json
-            - pnpm-lock.yaml
-            - pnpm-workspace.yaml
         - action: rebuild
           path: ./twin-frontend/package.json
         - action: rebuild
