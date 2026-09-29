@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # setup.sh - everything `docker compose up` cannot do for itself. Run once.
 #
-#   ./setup.sh              preflight, .env files, secrets, the host-side agent
+#   ./setup.sh              preflight, .env files, secrets, sandbox images, the host agent
 #   ./setup.sh --check      report only; nothing is written or installed
 #   ./setup.sh --no-agent   skip the Claude Code agent entirely
-#   ./setup.sh --pair       open the agent's 2-minute pairing window, nothing else
 #   ./setup.sh --root=DIR   set up that tree instead of this one (staging/ uses it)
 #   ./setup.sh --branch=B   the branch those checkouts are expected on (default dev)
 #   ./setup.sh --help
@@ -17,19 +16,24 @@
 # order that worked. The root docker-compose.yml owns that now. What is left is
 # the part no compose file can express:
 #
-#   1. Two secrets are minted per machine and therefore cannot arrive in a
-#      copied .env: the relay secret at ~/.twin-relay/secret, which the backend
-#      must hold as TWIN_ENGINE_SECRET, and the agent's own, which pairing
-#      exchanges. A copied value is not a missing value - it is a wrong one, and
-#      every engine route answers 401 without saying why.
-#   2. The relay secret has to exist *before* the engine container starts,
-#      because compose mounts ~/.twin-relay read-only: the minting code in
-#      twin_relay/secret.py writes where it finds nothing, and in there it finds
-#      nothing and cannot write.
-#   3. The Claude Code agent is a host process. It drives tmux and reads
-#      ~/.claude on this machine, so no container can hold it and `docker
-#      compose build` has nothing to say about it.
-#   4. The root .env carries what compose interpolates before a container exists
+#   1. Secrets are minted per machine and therefore cannot arrive in a copied
+#      .env: the relay secret at ~/.twin-relay/secret, which the backend must
+#      hold as TWIN_ENGINE_SECRET, and the sandbox broker's two tokens. A copied
+#      value is not a missing value - it is a wrong one, and every engine route
+#      answers 401 without saying why.
+#   2. The relay secret reaches the engine as TWIN_RELAY_SECRET in its .env,
+#      copied there from ~/.twin-relay/secret like the backend's copy. It was a
+#      read-only mount until the sandbox work, and a mounted file is readable
+#      by `execute` where the app's environment is not.
+#   3. The sandbox images - a tenant's container, its egress proxy, and a
+#      coding task's box - are built here, because the broker and the code
+#      worker start them and no compose service does.
+#   4. The Claude Code agent is a host process: a separate ingestion service
+#      on this machine, which reads ~/.claude here and pushes what its sessions
+#      did to the backend. No container can hold it, and `docker compose build`
+#      has nothing to say about it (2026-09-28; it was the container's own
+#      wire from SANDBOX-PLAN 7 until then).
+#   5. The root .env carries what compose interpolates before a container exists
 #      - a volume path, a build argument - and those live in two other files.
 #
 # Written for stock macOS: bash 3.2 (no mapfile, no associative arrays), BSD
@@ -39,7 +43,7 @@ set -uo pipefail
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
@@ -54,7 +58,6 @@ ROOT="$(pwd)"
 
 CHECK_ONLY=0
 WITH_AGENT=1
-PAIR_ONLY=0
 WANT_ROOT=
 # What the five checkouts are expected to be on. dev here, staging in staging/.
 EXPECT_BRANCH=dev
@@ -62,7 +65,6 @@ for arg in "$@"; do
   case "$arg" in
     --check) CHECK_ONLY=1 ;;
     --no-agent) WITH_AGENT=0 ;;
-    --pair) PAIR_ONLY=1 ;;
     --root=*) WANT_ROOT="${arg#--root=}" ;;
     --branch=*) EXPECT_BRANCH="${arg#--branch=}" ;;
     *)
@@ -183,6 +185,15 @@ expand_home() {
   esac
 }
 
+# A url-safe random secret: 32 bytes, base64url, no padding.
+new_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 32 | tr -d '\n=' | tr '+/' '-_'
+  else
+    head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_'
+  fi
+}
+
 # ----------------------------------------------------------------- repos ---
 say "repositories"
 for d in twin-backend twin-connectors twin-engine twin-frontend twin-memory; do
@@ -200,22 +211,6 @@ for d in twin-backend twin-connectors twin-engine twin-frontend twin-memory; do
   fi
 done
 finish_if_fatal
-
-# Pairing is a mode of its own because it cannot be part of a run. The window is
-# two minutes and the claim comes from the browser, so it has to be opened while
-# somebody is sitting in front of the Connections page.
-if [ "$PAIR_ONLY" -eq 1 ]; then
-  say "opening the agent's pairing window"
-  if ! curl -sf -m 2 http://127.0.0.1:47600/health >/dev/null 2>&1; then
-    fatal "the agent is not listening on 127.0.0.1:47600 - run ./setup.sh first"
-    finish_if_fatal
-  fi
-  (cd "$ENGINE" && make agent-pair 2>&1) | sed 's/^/    /'
-  status=$?
-  echo
-  info "now, within two minutes: open http://localhost:4000/connections and press Connect on Claude Code"
-  exit "$status"
-fi
 
 # ----------------------------------------------------------------- tools ---
 say "host tools"
@@ -333,13 +328,6 @@ require_value "$FRONTEND/.env.local" CLERK_SECRET_KEY "twin-frontend/.env.local"
   "the server half needs it too"
 require_value "$FRONTEND/.env.local" TWIN_PUBLIC_URL "twin-frontend/.env.local" \
   "the frontend's own public origin, which it sends as returnTo when you press Connect"
-# Not the same name as the engine's OPENROUTER_KEY, and not interchangeable.
-# The consumer is started with `--card-every`, which exits at startup without a
-# key - so compose restarts it forever and the only symptom is a service that
-# never settles. A fresh .env from .env.example has never had this.
-require_value "$MEMORY/.env" OPENROUTER_API_KEY "twin-memory/.env" \
-  "the consumer runs with --card-every and exits at startup without it"
-
 # Optional, and said out loud anyway: an absent key costs one capability rather
 # than the stack, so this warns where the others are fatal. `web_tools` drops
 # `web_search` and keeps `web_fetch`, so the twin answers "I cannot perform a
@@ -373,47 +361,38 @@ fi
 finish_if_fatal
 
 # ------------------------------------------------------------- twin root ---
-# One string in two namespaces. The engine mounts TWIN_ROOT into its container
-# at the same absolute path it has on the host, because a cwd the twin hands to
-# sessions.spawn is a host path to the agent and a container path to the engine.
+# One string in three processes, and not a directory on this machine: every
+# workspace is a volume in its account's own container, mounted at
+# <TWIN_ROOT>/<company>/<account> (twin-backend ADR 41). The engine, the broker
+# and the backend each build that path, and a session's cwd crosses all three.
 say "TWIN_ROOT"
 twin_root="$(expand_home "$(env_get "$ENGINE/.env" TWIN_ROOT 2>/dev/null)")"
 if [ -z "$twin_root" ]; then
   fatal "TWIN_ROOT is empty in twin-engine/.env - compose declares it \${TWIN_ROOT:?} and will not start"
-  add_todo "set TWIN_ROOT in twin-engine/.env to an absolute path on this machine"
+  add_todo "set TWIN_ROOT in twin-engine/.env to an absolute path, e.g. /twin-root"
 else
   case "$twin_root" in
-    /*) ;;
-    *) fatal "TWIN_ROOT is '$twin_root', which is not absolute - it is mounted at the same path inside the container" ;;
+    /*) ok "TWIN_ROOT=$twin_root" ;;
+    *) fatal "TWIN_ROOT is '$twin_root', which is not absolute - it is a path inside every tenant container" ;;
   esac
-  # Somebody else's home directory, which is the shape a copied .env takes: the
-  # path is absolute and plausible and belongs to the machine it came from.
-  # Worth refusing rather than creating, because `mkdir -p` succeeds and the
-  # twin then works in a tree nothing else on this machine knows about.
-  case "$twin_root" in
-    "$HOME" | "$HOME"/*) ;;
-    /Users/* | /home/*)
-      fatal "TWIN_ROOT is $twin_root, which is not under this machine's home ($HOME)"
-      add_todo "set TWIN_ROOT in twin-engine/.env to a path on this machine"
-      ;;
-  esac
-  # The backend holds the same path - it builds the workspace jail from it - and
-  # a mismatch is two services disagreeing about where a tenant's files are.
   be_root="$(expand_home "$(env_get "$BACKEND/.env" TWIN_ROOT 2>/dev/null)")"
   if [ -n "$be_root" ] && [ "$be_root" != "$twin_root" ]; then
     warn "twin-backend/.env has TWIN_ROOT=$be_root, a different path from the engine's"
     add_todo "make TWIN_ROOT the same string in twin-backend/.env and twin-engine/.env"
     STATUS=1
   fi
-  if [ "$FATAL" -eq 1 ]; then
-    :
-  elif [ -d "$twin_root" ]; then
-    ok "$twin_root exists"
-  elif [ "$CHECK_ONLY" -eq 1 ]; then
-    warn "$twin_root does not exist - would create it"
-  else
-    mkdir -p "$twin_root" && ok "created $twin_root"
-  fi
+fi
+# Every account is sandboxed, on every machine: an account the list does not
+# name has no workspace and no shell at all. So `*` is set, not left to a person.
+if [ "$(env_get "$ENGINE/.env" TWIN_SANDBOX_ACCOUNTS 2>/dev/null)" = '*' ]; then
+  ok "TWIN_SANDBOX_ACCOUNTS=* - every account has a sandbox"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "TWIN_SANDBOX_ACCOUNTS in twin-engine/.env is not * - would set it"
+  STATUS=1
+else
+  env_set "$ENGINE/.env" TWIN_SANDBOX_ACCOUNTS '*' \
+    && ok "set TWIN_SANDBOX_ACCOUNTS=* in twin-engine/.env - every account has a sandbox" \
+    || fatal "could not write twin-engine/.env"
 fi
 finish_if_fatal
 
@@ -450,10 +429,8 @@ else
   fi
 fi
 
-# 3. The relay secret, minted here rather than by the engine: compose mounts
-#    ~/.twin-relay read-only, so in the container the minting code finds nothing
-#    and cannot write. The host path is what varies between instances; inside,
-#    it is always /root.
+# 3. The relay secret, minted here rather than by the engine, which would mint
+#    one of its own that nothing else holds.
 relay_dir="$(expand_home "$(env_get "$ENGINE/.env" TWIN_RELAY_DIR 2>/dev/null || echo "$HOME/.twin-relay")")"
 [ -n "$relay_dir" ] || relay_dir="$HOME/.twin-relay"
 relay_file="$relay_dir/secret"
@@ -468,11 +445,7 @@ else
   # twin_relay/secret.py does, and for the same reason. The umask is scoped to
   # the subshell rather than set here, where it would follow every later file.
   (umask 077 && : >"$relay_file")
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -base64 32 | tr -d '\n=' | tr '+/' '-_' >"$relay_file"
-  else
-    head -c 32 /dev/urandom | base64 | tr -d '\n=' | tr '+/' '-_' >"$relay_file"
-  fi
+  new_secret >"$relay_file"
   chmod 600 "$relay_file"
   ok "minted the relay secret at $relay_file"
 fi
@@ -494,7 +467,22 @@ if [ -f "$relay_file" ]; then
   fi
 fi
 
-# 5. MEMORY_API_SECRET, the bearer twin-memory asks of every store read. Minted
+# 5. And the engine's, which it reads from its environment. A stale one fails
+#    the same way: every command route answers 401.
+if [ -f "$relay_file" ]; then
+  if [ "$(env_get "$ENGINE/.env" TWIN_RELAY_SECRET 2>/dev/null)" = "$relay_secret" ]; then
+    ok "TWIN_RELAY_SECRET matches the relay secret"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "TWIN_RELAY_SECRET in twin-engine/.env does not match $relay_file - would copy it across"
+    STATUS=1
+  else
+    env_set "$ENGINE/.env" TWIN_RELAY_SECRET "$relay_secret" \
+      && ok "copied the relay secret into twin-engine/.env as TWIN_RELAY_SECRET" \
+      || fatal "could not write twin-engine/.env"
+  fi
+fi
+
+# 6. MEMORY_API_SECRET, the bearer twin-memory asks of every store read. Minted
 #    in twin-memory and copied to the engine, its one caller: without it, any
 #    container on the compose network could read any account's memory by naming
 #    it in a header.
@@ -521,6 +509,28 @@ if [ -n "$memory_secret" ]; then
       && ok "copied MEMORY_API_SECRET into twin-engine/.env" \
       || fatal "could not write twin-engine/.env"
   fi
+fi
+
+# 7. OPENROUTER_API_KEY, twin-memory's name for the model key. The consumer
+#    cards every MEMORY_CARD_EVERY batches (10 unless the root .env says 0) and
+#    exits at start without it. Filled from the engine's when empty, and left
+#    alone once set: a key of its own for memory's spend is a person's call.
+card_every="$(env_get "$ROOT/.env" MEMORY_CARD_EVERY 2>/dev/null)"
+engine_key="$(env_get "$ENGINE/.env" OPENROUTER_KEY 2>/dev/null)"
+memory_key="$(env_get "$MEMORY/.env" OPENROUTER_API_KEY 2>/dev/null)"
+if [ "${card_every:-10}" = 0 ]; then
+  info "MEMORY_CARD_EVERY=0 - twin-memory makes no model calls and needs no key"
+elif [ "$memory_key" = "$engine_key" ]; then
+  ok "OPENROUTER_API_KEY in twin-memory matches the engine's OPENROUTER_KEY"
+elif [ -n "$memory_key" ]; then
+  warn "OPENROUTER_API_KEY in twin-memory is not the engine's OPENROUTER_KEY - fine if deliberate"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "OPENROUTER_API_KEY is empty in twin-memory - would copy the engine's OPENROUTER_KEY"
+  STATUS=1
+else
+  env_set "$MEMORY/.env" OPENROUTER_API_KEY "$engine_key" \
+    && ok "copied the engine's OPENROUTER_KEY into twin-memory/.env as OPENROUTER_API_KEY" \
+    || fatal "could not write twin-memory/.env"
 fi
 finish_if_fatal
 
@@ -551,6 +561,56 @@ else
     info "no CLOUDFLARE_TUNNEL_TOKEN - the tunnel profiles stay off, which is the default"
   fi
 fi
+
+# The broker's two tokens: the engine presents one to it, it presents the other
+# back. And the coding boxes' proxies' bearer, which they present to the engine
+# (twin-engine SANDBOX-PLAN phase 8). The root compose names each where it is
+# used, so this file is their one copy. Minted once, then kept.
+for key in TWIN_SANDBOX_BROKER_TOKEN TWIN_SANDBOX_AUDIT_TOKEN TWIN_BOX_PROXY_TOKEN; do
+  if env_has "$ROOT/.env" "$key"; then
+    ok "$key present"
+  elif [ "$CHECK_ONLY" -eq 1 ]; then
+    warn "no $key in the root .env - would mint it"
+  else
+    env_set "$ROOT/.env" "$key" "$(new_secret)" && ok "minted $key"
+  fi
+done
+
+# The model key, for `llm-proxy` alone. Copied rather than loaded with
+# `env_file`: a box can open a socket to that proxy, so it gets this key and its
+# bearer and none of the rest of twin-engine/.env. Kept in step on every run,
+# since twin-engine/.env is where the key is changed.
+model_key="$(env_get "$ENGINE/.env" OPENROUTER_KEY 2>/dev/null)"
+if [ -z "$model_key" ]; then
+  warn "no OPENROUTER_KEY in twin-engine/.env - coding tasks cannot reach a model"
+elif [ "$(env_get "$ROOT/.env" OPENROUTER_KEY 2>/dev/null)" = "$model_key" ]; then
+  ok "OPENROUTER_KEY matches twin-engine/.env"
+elif [ "$CHECK_ONLY" -eq 1 ]; then
+  warn "OPENROUTER_KEY in the root .env is missing or stale - would copy it from twin-engine/.env"
+  STATUS=1
+else
+  env_set "$ROOT/.env" OPENROUTER_KEY "$model_key" \
+    && ok "copied OPENROUTER_KEY into the root .env for llm-proxy"
+fi
+
+# ------------------------------------------------------------ sandbox images ---
+# What tenant containers, their egress proxy and coding tasks' boxes are made
+# from. The broker refuses to start without the first two, a task fails on its
+# first box without the third, and compose builds no image no service runs.
+# Built on every run, not only when missing: a machine that pulled new
+# sandbox/ source kept its old box, and an unchanged build is cached (~2s each).
+say "sandbox images"
+for pair in "twin-sandbox:dev workspace-image" "twin-egress:dev egress-image" "twin-box:dev box-image"; do
+  image=${pair% *} target=${pair#* }
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    info "would build $image (make $target in twin-engine)"
+  elif (cd "$ENGINE" && make "$target" >/dev/null 2>&1); then
+    ok "built $image"
+  else
+    fatal "could not build $image - run make $target in twin-engine"
+  fi
+done
+finish_if_fatal
 
 # The host-side spellings, which compose overrides for every container but
 # `make run` and `make api` still read. Warned rather than rewritten: which
@@ -607,25 +667,32 @@ p_engine="$(env_get "$ROOT/.env" TWIN_API_PORT 2>/dev/null)"; : "${p_engine:=800
 p_mem="$(env_get "$ROOT/.env" MEMORY_API_PORT 2>/dev/null)"; : "${p_mem:=8200}"
 p_pg="$(env_get "$ROOT/.env" POSTGRES_PORT 2>/dev/null)"; : "${p_pg:=5500}"
 p_redis="$(env_get "$ROOT/.env" REDIS_PORT 2>/dev/null)"; : "${p_redis:=6500}"
+p_temporal="$(env_get "$ROOT/.env" TEMPORAL_UI_PORT 2>/dev/null)"; : "${p_temporal:=8233}"
+p_preview="$(env_get "$ROOT/.env" TWIN_PREVIEW_PORT 2>/dev/null)"; : "${p_preview:=47620}"
 cat <<EOF
     docker compose up -d        <- the whole stack, from here
 
     frontend    http://localhost:$p_front      open this one
     backend     http://localhost:$p_api
-    engine      http://127.0.0.1:$p_engine      unauthenticated dev harness, loopback only
+    engine      http://127.0.0.1:$p_engine      every route needs the relay secret, loopback only
     memory      http://127.0.0.1:$p_mem      retrieval only, loopback only
-    connectors  connectors:8090            no host port, by design
-    postgres    localhost:$p_pg             twin_backend / twin_engine / twin_memory
-    redis       localhost:$p_redis
+    temporal    http://127.0.0.1:$p_temporal      the workflow UI
+    langfuse    http://127.0.0.1:3000      the twin's traces
+    preview     http://127.0.0.1:$p_preview     what a coding box serves, at <box>.<port>.preview.localhost
+    postgres    127.0.0.1:$p_pg             twin_backend / twin_engine / twin_memory
+    redis       127.0.0.1:$p_redis
+
+    README.md's "What runs" has every service, the ones with no host port too.
 EOF
 echo
 printf '%sthe two steps a script cannot do for you:%s\n' "$BLU" "$OFF"
 cat <<'EOF'
   1. Sign in at http://localhost:4000. Identity is Clerk's (ADR 37), so this is
      a browser sign-in and there is no terminal equivalent.
-  2. Pair Claude Code. Open http://localhost:4000/connections, then run
-     ./setup.sh --pair and press Connect within two minutes. The agent mints its
-     own token during that claim; nothing is pasted.
+  2. Pair Claude Code. On http://localhost:4000/connections press Connect on
+     Claude Code and give it the agent's pairing password - `make
+     agent-password` in twin-engine says whether one is set, and
+     `TWIN_AGENT_PAIR_PASSWORD=... make agent-setup` there sets it.
 EOF
 echo
 info "logs:     docker compose logs -f <service>"
