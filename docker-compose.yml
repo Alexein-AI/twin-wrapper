@@ -602,20 +602,18 @@ services:
     # only boxes, and every box can open a socket to it.
     networks: [preview-edge]
 
+  # `next dev`, not a production build: the Dockerfile's `dev` stage, over the
+  # same install as the runtime image. Nothing is inlined at build time, so the
+  # publishable key arrives in `environment` like everything else and changing
+  # it is a restart, not a rebuild.
   frontend:
     build:
       context: ./twin-frontend
-      args:
-        # `next build` inlines this into the client bundle, so it cannot arrive
-        # at runtime the way the urls below do - changing it needs a rebuild.
-        # Publishable by design, so an image layer holding it gives nothing away.
-        # It has to be interpolated from the root .env rather than read from
-        # .env.local, because `env_file` feeds a container and not a build.
-        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
+      target: dev
     restart: unless-stopped
     env_file: [./twin-frontend/.env.local]
     environment:
-      NODE_ENV: production
+      NODE_ENV: development
       TWIN_ENV: ${TWIN_ENV:-dev}
       # Fixed, like the backend's: a container has its own namespace, so only
       # the host side varies and `frontend:4000` then means one thing.
@@ -629,14 +627,13 @@ services:
       # :8080 is what broke Connect: the frontend sends `<origin>/connections`
       # as `returnTo`, and the backend refuses any origin that is not
       # FRONTEND_URL's. Move this and the backend's FRONTEND_URL together.
-      # The server half reads the publishable key too, so it is here as well as
-      # in the build args above. The secret key comes from .env.local and is
-      # never a build arg, which would leave it in an image layer.
-      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?}
+      # The secret key comes from .env.local.
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:?set it in the root .env - run ./setup.sh}
     ports:
       - '${FRONTEND_PORT:-4000}:4000'
     # A bare `/` answers a redirect to /sign-in with no session, which is the
-    # correct response and a fine liveness signal.
+    # correct response and a fine liveness signal. The first request compiles
+    # the route, so the dev server gets longer to answer than a built one did.
     healthcheck:
       test:
         - CMD-SHELL
@@ -644,28 +641,37 @@ services:
           node -e "require('node:http').get({host:'127.0.0.1',port:4000},
           r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
       interval: 10s
-      timeout: 5s
+      timeout: 30s
       retries: 6
-      start_period: 20s
+      start_period: 60s
     depends_on:
       backend: { condition: service_started }
-    # A production `next build`, so there is no dev server to hot-reload: every
-    # change is a rebuild of the image, which takes a minute, not a second. For
-    # instant HMR run `pnpm dev` on the host instead.
+    # Synced, not bind-mounted: this bind mount would be virtiofs, which never
+    # emits the inotify events `next dev` needs. A synced write lands on the
+    # container's own filesystem, so it does fire them, and HMR picks it up in
+    # a second. Without `--watch` the container serves the source it was built
+    # with. A dependency change needs the install redone, so it rebuilds.
     develop:
       watch:
-        - action: rebuild
+        - action: sync
           path: ./twin-frontend
+          target: /app
           ignore:
             - node_modules/
             - .next/
             - .git/
-            - tests/
-            - docs/
             - test-results/
             - playwright-report/
             - coverage/
-            - '**/*.md'
+            - package.json
+            - pnpm-lock.yaml
+            - pnpm-workspace.yaml
+        - action: rebuild
+          path: ./twin-frontend/package.json
+        - action: rebuild
+          path: ./twin-frontend/pnpm-lock.yaml
+        - action: rebuild
+          path: ./twin-frontend/pnpm-workspace.yaml
 
   # ---------------------------------------------------------------- memory --
   #
