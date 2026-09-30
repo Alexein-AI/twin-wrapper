@@ -38,13 +38,12 @@ Set them all, then run it again:
 
 | File | Values |
 | --- | --- |
-| `twin-backend/.env` | `CLERK_SECRET_KEY`, `CLERK_JWT_KEY`, `TWIN_ROOT` |
+| `twin-backend/.env` | `CLERK_SECRET_KEY`, `CLERK_JWT_KEY` |
 | `twin-frontend/.env.local` | `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, `TWIN_PUBLIC_URL` |
-| `twin-engine/.env` | `OPENROUTER_KEY`, `TWIN_ROOT` |
+| `twin-engine/.env` | `OPENROUTER_KEY` |
 
 - The Clerk keys are one Clerk application's, so `CLERK_SECRET_KEY` is the
   same string in both files.
-- `TWIN_ROOT` is an absolute path, and the same string in both files.
 - `TWIN_PUBLIC_URL` must share an origin with the backend's `FRONTEND_URL`,
   or Connect is refused. `http://localhost:4000` for both.
 

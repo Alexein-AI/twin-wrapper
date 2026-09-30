@@ -360,28 +360,7 @@ if [ -n "$public_origin" ] && [ -n "$frontend_url" ]; then
 fi
 finish_if_fatal
 
-# ------------------------------------------------------------- twin root ---
-# One string in three processes, and not a directory on this machine: every
-# workspace is a volume in its account's own container, mounted at
-# <TWIN_ROOT>/<company>/<account> (twin-backend ADR 41). The engine, the broker
-# and the backend each build that path, and a session's cwd crosses all three.
-say "TWIN_ROOT"
-twin_root="$(expand_home "$(env_get "$ENGINE/.env" TWIN_ROOT 2>/dev/null)")"
-if [ -z "$twin_root" ]; then
-  fatal "TWIN_ROOT is empty in twin-engine/.env - compose declares it \${TWIN_ROOT:?} and will not start"
-  add_todo "set TWIN_ROOT in twin-engine/.env to an absolute path, e.g. /twin-root"
-else
-  case "$twin_root" in
-    /*) ok "TWIN_ROOT=$twin_root" ;;
-    *) fatal "TWIN_ROOT is '$twin_root', which is not absolute - it is a path inside every tenant container" ;;
-  esac
-  be_root="$(expand_home "$(env_get "$BACKEND/.env" TWIN_ROOT 2>/dev/null)")"
-  if [ -n "$be_root" ] && [ "$be_root" != "$twin_root" ]; then
-    warn "twin-backend/.env has TWIN_ROOT=$be_root, a different path from the engine's"
-    add_todo "make TWIN_ROOT the same string in twin-backend/.env and twin-engine/.env"
-    STATUS=1
-  fi
-fi
+# ------------------------------------------------------ sandbox accounts ---
 # Every account is sandboxed, on every machine: an account the list does not
 # name has no workspace and no shell at all. So `*` is set, not left to a person.
 if [ "$(env_get "$ENGINE/.env" TWIN_SANDBOX_ACCOUNTS 2>/dev/null)" = '*' ]; then
@@ -535,16 +514,15 @@ fi
 finish_if_fatal
 
 # -------------------------------------------------------------- root env ---
-# Only what compose interpolates *before* a container exists: a volume path and
-# a build argument. Everything else each service needs is in that repository's
+# Only what compose interpolates *before* a container exists: a build argument
+# and the tunnel token. Everything else each service needs is in that repository's
 # own .env, which docker-compose.yml loads with `env_file`.
 say "root .env"
 clerk_key="$(env_get "$FRONTEND/.env.local" NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY 2>/dev/null)"
 if [ "$CHECK_ONLY" -eq 1 ]; then
-  [ -f "$ROOT/.env" ] && ok ".env exists" || warn "no root .env - would write TWIN_ROOT and the Clerk key"
+  [ -f "$ROOT/.env" ] && ok ".env exists" || warn "no root .env - would write the Clerk key"
 else
   [ -f "$ROOT/.env" ] || { cp "$ROOT/.env.example" "$ROOT/.env" && chmod 600 "$ROOT/.env"; }
-  env_set "$ROOT/.env" TWIN_ROOT "$twin_root" && ok "TWIN_ROOT=$twin_root"
   # Copied rather than referenced: compose reads one .env, and `next build`
   # needs this as a build argument, which `env_file` cannot supply.
   env_set "$ROOT/.env" NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY "$clerk_key" \
