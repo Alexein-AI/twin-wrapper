@@ -429,13 +429,21 @@ services:
       # the register.
       TWIN_SANDBOX_NETWORK_POOL: ${TWIN_SANDBOX_NETWORK_POOL:-10.204.0.0/16}
       TWIN_EGRESS_SUBNET: ${TWIN_EGRESS_SUBNET:-10.203.0.0/24}
+      # Which instance of the system this broker is. The proxy's network, its
+      # container and the grants volume are named in the *daemon's* namespace,
+      # which every stack on this machine shares - so without this, dev's
+      # broker and staging's both make `twin-egress-proxy`, the second adopts
+      # the first's, and two stacks' tenants sit behind one proxy enforcing
+      # one stack's grants. Subnets cannot separate them; the name is what
+      # collides. Staging sets it in staging/.env.
+      TWIN_SANDBOX_STACK: ${TWIN_SANDBOX_STACK:-twin}
     volumes:
       # Here and nowhere else. `engine` must never grow this line.
       - /var/run/docker.sock:/var/run/docker.sock
       # The hosts each person let their twin's own shell reach beyond the
       # allowlist (`allow_host`), written here and mounted read-only into the
       # egress proxy the broker makes (twin-engine `twin_sandbox/grants.py`).
-      - twin-egress-rules:/var/lib/twin-egress
+      - egress-rules:/var/lib/twin-egress
 
   # The worker: `python -m twin_workflows`, which executes every turn. Scale it
   # with `docker compose up --scale engine-worker=N`; Temporal hands each chat
@@ -875,9 +883,14 @@ volumes:
   # which are in the engine's database.
   twin-temporal-data:
   # What each person let their twin's shell reach. Named outright, because the
-  # broker mounts it by that name into the egress proxy it makes itself.
-  twin-egress-rules:
-    name: twin-egress-rules
+  # broker mounts it by that name into the egress proxy it makes itself - and
+  # named per stack, because that name is the daemon's and not the project's:
+  # one volume for two stacks means one stack's broker writes the grants the
+  # other stack's proxy enforces, keyed by ids from a different database.
+  # The key is compose's own handle and cannot be interpolated - only `name`
+  # can, and `name` is the one the daemon sees.
+  egress-rules:
+    name: ${TWIN_SANDBOX_STACK:-twin}-egress-rules
 
 # Pinned off 172.19/16, which is this office's LAN (172.19.2.0/23). Compose's
 # default pick swallowed it once: every container routed 172.19.2.202 onto its
