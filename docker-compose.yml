@@ -692,17 +692,18 @@ services:
     # because an unacknowledged batch is requeued on the next start.
     init: true
     stop_grace_period: 60s
-    # `--card-every 10` turns on the one paid stage on the write path: every
+    # `--encode-every 10` turns on the one paid stage on the write path: every
     # tenth batch, and again whenever the queue goes quiet, threads that have
-    # settled are carded. Without it a live store accumulates threads no card
+    # settled are encoded. Without it a live store accumulates threads nothing
     # has ever read, and the facts lane - which is what retrieval actually
-    # ranks over - stays empty until somebody runs `store card` by hand.
+    # ranks over - stays empty until somebody runs `store encode` by hand. (`card` was renamed
+    # `encode` in twin-memory on 6 Oct 2026, flag and all.)
     #
     # `settled_only` is what makes the rhythm affordable rather than reckless:
     # a conversation arriving over six batches is one call once it goes quiet,
     # not six as it grows. Set it to 0 to go back to never spending here.
     command:
-      ['python', '-m', 'consumer', '/var/twin/store', '--card-every', '${MEMORY_CARD_EVERY:-10}']
+      ['python', '-m', 'consumer', '/var/twin/store', '--encode-every', '${MEMORY_ENCODE_EVERY:-${MEMORY_CARD_EVERY:-10}}']
     env_file: [./twin-memory/.env]
     environment:
       # Database 0 explicitly, and the same one the backend's sink writes to.
