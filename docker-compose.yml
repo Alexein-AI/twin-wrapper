@@ -136,8 +136,13 @@ services:
   # ------------------------------------------------------------------ apps --
 
   # The API, the ingest worker and the webhook receiver, in one process.
+  #
+  # Opt-in while the hub stands in for it (below): the two would fight for :8080 and for the
+  # `backend` name. `docker compose --profile backend up -d backend` brings it back - give one
+  # of them another API_PORT first.
   backend:
     build: ./twin-backend
+    profiles: ['backend']
     # restart: unless-stopped
     command: ['node', 'apps/backend/src/index.ts']
     env_file: [./twin-backend/.env]
@@ -204,6 +209,65 @@ services:
         # dependency needs the image rebuilt, not the process restarted.
         - action: rebuild
           path: ./twin-backend/pnpm-lock.yaml
+
+  # The hub (twin-connectors/apps/hub, ADR 43), in the backend's place: its port, its public
+  # url and its OAuth callback path (/v1/oauth/<provider>/callback), so OAuth apps registered
+  # against the backend work unchanged, and its `backend` name, so the tunnels reach it.
+  #
+  # What that costs: the frontend, engine, engine-worker and code-worker still call
+  # http://backend:8080 for the backend's own API, and the hub answers those with 404 - the
+  # twin's features that need the backend do not work while the hub stands in.
+  #
+  # Its own env file and nothing else: the connectors service above must never see
+  # DATABASE_URL or the vault key (ADR 25). The urls below are this network's, not the host's.
+  hub:
+    build: { context: ./twin-connectors, dockerfile: Dockerfile.hub }
+    restart: unless-stopped
+    env_file: [./twin-connectors/apps/hub/.env]
+    environment:
+      HUB_PORT: 8080
+      HUB_PUBLIC_URL: ${BASE_URL:-http://localhost:8080}
+      DATABASE_URL: postgres://twin:twin@postgres:5432/twin_hub
+      CONNECTORS_URL: http://connectors:8090
+      REDIS_URL: redis://redis:6379/0
+      MEMORY_API_URL: http://memory-api:8000
+    ports:
+      - '${API_PORT:-8080}:8080'
+    networks:
+      default:
+        aliases: [backend]
+    volumes:
+      # Mounted like the connectors service, so an edit needs a restart and not a rebuild.
+      - ./twin-connectors/src:/app/src
+      - ./twin-connectors/packages:/app/packages
+      - ./twin-connectors/apps:/app/apps
+      - ./twin-connectors/config:/app/config
+      - /app/node_modules
+      - /app/packages/config/node_modules
+      - /app/packages/core/node_modules
+      - /app/packages/db/node_modules
+      - /app/packages/ingest/node_modules
+      - /app/packages/oauth/node_modules
+      - /app/packages/providers/node_modules
+      - /app/packages/queue/node_modules
+      - /app/packages/sdk/node_modules
+      - /app/packages/telemetry/node_modules
+      - /app/apps/hub/node_modules
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      connectors: { condition: service_started }
+      memory-api: { condition: service_started }
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "require('node:http').get({host:'127.0.0.1',port:8080,path:'/health'},
+          r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   # Every provider's code, and no database at all. It publishes no host port:
   # the backend reaches it over this network and nothing else should reach it.
@@ -661,7 +725,8 @@ services:
       retries: 6
       start_period: 60s
     depends_on:
-      backend: { condition: service_started }
+      # Not required: the backend is opt-in while the hub stands in for it.
+      backend: { condition: service_started, required: false }
     # Source arrives by the bind mount above, so nothing syncs here and HMR
     # needs no `docker compose watch` running. Only a dependency change still
     # does, because the install lives in the image: run `docker compose watch
@@ -850,7 +915,7 @@ services:
       # anyone without a token.
       - ${CLOUDFLARE_TUNNEL_TOKEN:-}
     depends_on:
-      backend: { condition: service_started }
+      hub: { condition: service_started }
 
   # No account and no hostname of your own. A quick tunnel is renamed on every
   # start, so each run needs BASE_URL moved and every provider's Request URL
@@ -858,7 +923,7 @@ services:
   #
   #   docker compose --profile tunnel up -d tunnel
   #   docker compose logs tunnel | grep -o 'https://.*trycloudflare.com'
-  #   BASE_URL=<that> docker compose up -d --force-recreate backend
+  #   BASE_URL=<that> docker compose up -d --force-recreate hub
   tunnel:
     image: cloudflare/cloudflared:latest
     profiles: ['tunnel']
@@ -868,7 +933,7 @@ services:
     restart: 'no'
     command: tunnel --no-autoupdate --url http://backend:8080
     depends_on:
-      backend: { condition: service_started }
+      hub: { condition: service_started }
 
 volumes:
   twin-postgres-data:

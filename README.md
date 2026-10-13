@@ -61,7 +61,8 @@ the [two steps no script can do](#two-steps-no-script-can-do).
 | Service | Where | What it is |
 | --- | --- | --- |
 | `frontend` | <http://localhost:4000> | the web client. **Start here.** |
-| `backend` | <http://localhost:8080> | API, ingest worker, and the webhook receiver |
+| `hub` | <http://localhost:8080> | the hosted connections hub (twin-connectors `apps/hub`), standing in for the backend: its port, public url and OAuth callback path. Set up at `/setup`. The twin's features that need the backend's own API do not work meanwhile |
+| `backend` | opt-in: `--profile backend` | API, ingest worker, and the webhook receiver. Off by default while the hub holds :8080; give one of them another `API_PORT` to run both |
 | `connectors` | `connectors:8090` | every provider's code. No host port, by design |
 | `engine` | <http://127.0.0.1:8000> | the engine's API, `twin_relay`. Every route needs the relay secret; it runs no turns itself. Loopback only |
 | `engine-worker` | — | runs every turn, off Temporal. `--scale engine-worker=N` for more |
