@@ -711,8 +711,15 @@ services:
       # handed yesterday's card for today's thread, and the cache would grow in
       # this container's writable layer until it was recreated.
       LLM_CACHE: 'off'
+      # Where memory-replicator copies the store, so an end user erased whole is
+      # erased from there too (twin-memory RUNBOOK.md, "Backup and restore").
+      <<: &memory-replica
+        LITESTREAM_REPLICA_URL: ${LITESTREAM_REPLICA_URL:-file:///var/twin/replica}
+        LITESTREAM_META_DIR: /var/twin/litestream
     volumes:
       - twin-memory-store:/var/twin/store
+      - &memory-litestream twin-memory-litestream:/var/twin/litestream
+      - &memory-replica-volume twin-memory-replica:/var/twin/replica
     depends_on:
       redis: { condition: service_healthy }
     # Alive means it said so within the last minute: `QueueFeed.beat` sets the
@@ -772,6 +779,9 @@ services:
       # empty memory while the consumer filed each account's events under its
       # own id. MEMORY_API_SECRET comes from twin-memory/.env (setup.sh mints it).
       TWIN_REQUIRE_ACCOUNT: '1'
+      # An end user erased whole through the console loses their copies in the
+      # replica in the same request.
+      <<: *memory-replica
     ports:
       - '127.0.0.1:${MEMORY_API_PORT:-8200}:8000'
     depends_on:
@@ -785,6 +795,8 @@ services:
       # restart, because the reader's open connection reads committed state. A
       # batch still in flight is the only thing it cannot see yet.
       - twin-memory-store:/var/twin/store
+      - *memory-litestream
+      - *memory-replica-volume
     develop:
       watch: *memory-watch
     healthcheck:
@@ -802,6 +814,35 @@ services:
       timeout: 5s
       retries: 6
       start_period: 15s
+
+  # The store's off-machine copy: Litestream, from the memory image, copying
+  # every account's database as it is written. Without it the store volume is
+  # the only copy of every account's memory, paid records included. Set
+  # LITESTREAM_REPLICA_URL (s3://bucket/path) in the root .env, which compose
+  # interpolates, and AWS_* credentials in twin-memory/.env; unset, it copies
+  # into the twin-memory-replica volume on this machine, which survives a
+  # container and not a disk.
+  memory-replicator:
+    build: ./twin-memory
+    restart: unless-stopped
+    command: ['litestream', 'replicate', '-config', '/app/configs/litestream.yml']
+    env_file: [./twin-memory/.env]
+    environment: *memory-replica
+    volumes:
+      - twin-memory-store:/var/twin/store
+      - *memory-litestream
+      - *memory-replica-volume
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request,sys;
+          sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9090/metrics',
+          timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # ---------------------------------------------------------------- tunnel --
   #
@@ -870,6 +911,10 @@ volumes:
   # so losing this loses everything the twin remembers that is not still in
   # twin-backend's `events` table.
   twin-memory-store:
+  # Litestream's working copy of each database, and on a machine with no
+  # LITESTREAM_REPLICA_URL the replica itself.
+  twin-memory-litestream:
+  twin-memory-replica:
   # Temporal's history: every chat's queue, pending approval and timers.
   # Losing it loses what in-flight chats were waiting on, never their messages,
   # which are in the engine's database.
